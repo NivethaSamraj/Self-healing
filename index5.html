@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Self Healing Playground</title>
+
+  <script>
+    setTimeout(() => {
+
+      const container =
+        document.createElement('div');
+
+      container.innerHTML = `
+        <span>Delayed Locator</span>
+        <input type="text">
+      `;
+
+      document.body.appendChild(container);
+
+    }, 3000);
+  </script>
+
+</head>
+
+<body>
+
+  <h1>Self Healing Playground</h1>
+
+  <!-- CASE 1 -->
+  <section>
+    <header>
+      <span>Product Matrix</span>
+    </header>
+
+    <article>
+      <div>
+        <input type="text">
+      </div>
+    </article>
+  </section>
+
+  <hr>
+
+  <!-- CASE 2 -->
+  <div>
+    <label>Employee Section</label>
+    <input type="text">
+  </div>
+
+  <hr>
+
+  <!-- CASE 3 -->
+  <div>
+    <label>Payroll Entry</label>
+
+    <span>Helper</span>
+
+    <span>Helper</span>
+
+    <input type="text">
+  </div>
+
+  <hr>
+
+  <!-- CASE 4 -->
+  <div>
+    <input type="text">
+
+    <span>Inventory Buffer</span>
+  </div>
+
+  <hr>
+
+  <!-- CASE 5 -->
+  <table border="1">
+
+    <tr>
+      <td>Salary</td>
+
+      <td>
+        <input type="text">
+      </td>
+    </tr>
+
+  </table>
+
+  <hr>
+
+  <!-- CASE 6 -->
+  <section>
+
+    <span>Shipment Tracker</span>
+
+    <div>
+      <div>
+        <div>
+          <input type="text">
+        </div>
+      </div>
+    </div>
+
+  </section>
+
+  <hr>
+
+  <!-- CASE 7 -->
+  <div>
+
+    <span>Customer Ledger</span>
+
+    <div>
+      <div>
+        <input type="text">
+      </div>
+    </div>
+
+  </div>
+
+  <hr>
+
+  <!-- CASE 8 -->
+  <div>
+    <span>Status</span>
+    <input type="text">
+  </div>
+
+  <div>
+    <span>Status</span>
+    <input type="text">
+  </div>
+
+</body>
+
+</html>

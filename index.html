@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>Retail Commerce Platform</title>
+
+  <!-- GOOGLE FONT -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+  <link
+
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  >
+
+  <style>
+
+    *{
+      margin:0;
+      padding:0;
+      box-sizing:border-box;
+    }
+
+    body{
+      font-family:'Inter',sans-serif;
+      background:#f1f5f9;
+      color:#0f172a;
+      padding:40px 20px;
+    }
+
+    .container{
+      max-width:1400px;
+      margin:auto;
+    }
+
+    .page-header{
+      margin-bottom:35px;
+      text-align:center;
+    }
+
+    .page-header h1{
+      font-size:38px;
+      font-weight:700;
+      margin-bottom:10px;
+      color:#0f172a;
+    }
+
+    .page-header p{
+      color:#64748b;
+      font-size:16px;
+    }
+
+    .grid{
+      display:grid;
+      grid-template-columns:1fr 1fr;
+      gap:28px;
+    }
+
+    .card{
+      background:#ffffff;
+      border-radius:20px;
+      padding:30px;
+      box-shadow:
+        0 10px 30px rgba(15,23,42,0.06);
+      border:1px solid #e2e8f0;
+    }
+
+    .card h2{
+      font-size:24px;
+      margin-bottom:25px;
+      color:#0f172a;
+    }
+
+    .field{
+      margin-bottom:22px;
+    }
+
+    label{
+      display:block;
+      margin-bottom:8px;
+      font-size:14px;
+      font-weight:600;
+      color:#334155;
+    }
+
+    input,
+    textarea,
+    select{
+      width:100%;
+      padding:14px 16px;
+      border-radius:12px;
+      border:1px solid #cbd5e1;
+      background:#fff;
+      font-size:15px;
+      transition:0.25s ease;
+      outline:none;
+    }
+
+    input:focus,
+    textarea:focus,
+    select:focus{
+      border-color:#2563eb;
+      box-shadow:0 0 0 4px rgba(37,99,235,0.12);
+    }
+
+    textarea{
+      resize:vertical;
+      min-height:120px;
+    }
+
+    .radio-group,
+    .checkbox-group{
+      display:flex;
+      align-items:center;
+      gap:12px;
+      margin-top:10px;
+      flex-wrap:wrap;
+    }
+
+    .radio-item{
+      display:flex;
+      align-items:center;
+      gap:6px;
+    }
+
+    .button-group{
+      display:flex;
+      gap:14px;
+      margin-top:25px;
+      flex-wrap:wrap;
+    }
+
+    button{
+      border:none;
+      border-radius:12px;
+      padding:14px 22px;
+      font-size:15px;
+      font-weight:600;
+      cursor:pointer;
+      transition:0.2s ease;
+    }
+
+    .primary-btn{
+      background:#2563eb;
+      color:white;
+    }
+
+    .primary-btn:hover{
+      background:#1d4ed8;
+      transform:translateY(-1px);
+    }
+
+    .secondary-btn{
+      background:#e2e8f0;
+      color:#0f172a;
+    }
+
+    .secondary-btn:hover{
+      background:#cbd5e1;
+    }
+
+    .dashboard-top{
+      display:flex;
+      align-items:center;
+      gap:20px;
+      margin-bottom:25px;
+      flex-wrap:wrap;
+    }
+
+    .product-image{
+      width:120px;
+      height:120px;
+      border-radius:18px;
+      object-fit:cover;
+      border:1px solid #e2e8f0;
+    }
+
+    .product-card{
+      margin-top:25px;
+      border:1px solid #e2e8f0;
+      border-radius:16px;
+      padding:20px;
+      background:#f8fafc;
+    }
+
+    .product-card h3{
+      margin-bottom:10px;
+      font-size:20px;
+    }
+
+    .product-card p{
+      color:#64748b;
+      margin-bottom:14px;
+    }
+
+    .badge-wrapper{
+      margin-top:20px;
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+
+    .badge{
+      display:inline-flex;
+      align-items:center;
+      padding:8px 14px;
+      border-radius:999px;
+      background:#dbeafe;
+      color:#1d4ed8;
+      font-size:13px;
+      font-weight:600;
+    }
+
+    table{
+      width:100%;
+      border-collapse:collapse;
+      margin-top:25px;
+      overflow:hidden;
+      border-radius:12px;
+    }
+
+    th{
+      background:#eff6ff;
+      color:#1e3a8a;
+      font-weight:700;
+      text-align:left;
+      padding:14px;
+    }
+
+    td{
+      padding:14px;
+      border-top:1px solid #e2e8f0;
+      color:#334155;
+    }
+
+    tr:hover{
+      background:#f8fafc;
+    }
+
+    .wrapper{
+      margin-top:30px;
+      padding:20px;
+      border-radius:16px;
+      border:1px dashed #93c5fd;
+      background:#eff6ff;
+    }
+
+    .xpath-box{
+      margin-top:20px;
+      padding:16px;
+      border-radius:12px;
+      background:#fef2f2;
+      color:#dc2626;
+      font-weight:600;
+      border:1px solid #fecaca;
+    }
+
+    .hidden{
+      display:none;
+    }
+
+    @media(max-width:1000px){
+
+      .grid{
+        grid-template-columns:1fr;
+      }
+
+    }
+
+  </style>
+
+</head>
+
+<body>
+
+  <div class="container">
+
+    <!-- HEADER -->
+    <div class="page-header">
+
+      <h1>
+        Enterprise Retail Management Portal
+      </h1>
+
+      <p>
+        Modern retail dashboard with customer checkout,
+        order tracking and XPath/CSS locator testing support.
+      </p>
+
+    </div>
+
+    <div class="grid">
+
+      <!-- LEFT CARD -->
+      <div class="card">
+
+        <h2>
+          Customer Checkout Form
+        </h2>
+
+        <div class="field">
+
+          <label for="customerName">
+            Customer Name
+          </label>
+
+          <input
+            id="customerName"
+            type="text"
+            placeholder="Enter customer name"
+          />
+
+        </div>
+
+        <div class="field">
+
+          <label for="customerEmail">
+            Email Address
+          </label>
+
+          <input
+            id="customerEmail"
+            type="email"
+            placeholder="shopper@example.com"
+          />
+
+        </div>
+
+        <div class="field">
+
+          <label for="customerPhone">
+            Phone Number
+          </label>
+
+          <input
+            id="customerPhone"
+            type="tel"
+            placeholder="+91 XXXXX XXXXX"
+          />
+
+        </div>
+
+        <div class="field">
+
+          <label for="accountPassword">
+            Account Password
+          </label>
+
+          <input
+            id="accountPassword"
+            type="password"
+            placeholder="Create password"
+          />
+
+        </div>
+
+        <div class="field">
+
+          <label for="productSearch">
+            Search Products
+          </label>
+
+          <input
+            id="productSearch"
+            type="search"
+            placeholder="Search products"
+          />
+
+        </div>
+
+        <div class="field">
+
+          <label for="productCategory">
+            Product Category
+          </label>
+
+          <select id="productCategory">
+
+            <option value="">
+              Select category
+            </option>
+
+            <option value="electronics">
+              Electronics
+            </option>
+
+            <option value="fashion">
+              Fashion
+            </option>
+
+            <option value="grocery">
+              Grocery
+            </option>
+
+            <option value="beauty">
+              Beauty
+            </option>
+
+          </select>
+
+        </div>
+
+        <div class="field">
+
+          <label>
+            Payment Method
+          </label>
+
+          <div class="radio-group">
+
+            <div class="radio-item">
+
+              <input
+                type="radio"
+                id="creditCard"
+                name="payment"
+              />
+
+              <label for="creditCard">
+                Credit Card
+              </label>
+
+            </div>
+
+            <div class="radio-item">
+
+              <input
+                type="radio"
+                id="upiPayment"
+                name="payment"
+              />
+
+              <label for="upiPayment">
+                UPI
+              </label>
+
+            </div>
+
+          </div>
+
+        </div>
+
+        <div class="field">
+
+          <div class="checkbox-group">
+
+            <input
+              type="checkbox"
+              id="offers"
+            />
+
+            <label for="offers">
+              Receive promotional offers
+            </label>
+
+          </div>
+
+        </div>
+
+        <div class="field">
+
+          <label for="deliveryAddress">
+            Delivery Address
+          </label>
+
+          <textarea
+            id="deliveryAddress"
+            placeholder="Enter full address"
+          ></textarea>
+
+        </div>
+
+        <div class="field">
+
+          <label for="deliveryDate">
+            Preferred Delivery Date
+          </label>
+
+          <input
+            id="deliveryDate"
+            type="date"
+          />
+
+        </div>
+
+        <div class="field">
+
+          <label for="ratingRange">
+            Product Rating Filter
+          </label>
+
+          <input
+            id="ratingRange"
+            type="range"
+            min="1"
+            max="5"
+          />
+
+        </div>
+
+        <div class="field">
+
+          <label for="invoiceUpload">
+            Upload Invoice
+          </label>
+
+          <input
+            id="invoiceUpload"
+            type="file"
+          />
+
+        </div>
+
+        <div class="button-group">
+
+          <button
+            id="placeOrderBtn"
+            class="primary-btn"
+          >
+            Place Order
+          </button>
+
+          <button
+            id="cancelOrderBtn"
+            class="secondary-btn"
+          >
+            Cancel Order
+          </button>
+
+        </div>
+
+      </div>
+
+      <!-- RIGHT CARD -->
+      <div class="card">
+
+        <h2>
+          Retail Dashboard
+        </h2>
+
+        <div class="dashboard-top">
+
+          <img
+            src="https://dummyimage.com/120x120/2563eb/ffffff"
+            class="product-image"
+            alt="Featured Product Image"
+          />
+
+          <div style="flex:1;">
+
+            <label for="couponCode">
+              Coupon Code
+            </label>
+
+            <input
+              id="couponCode"
+              type="text"
+              placeholder="Enter coupon code"
+            />
+
+          </div>
+
+        </div>
+
+        <button class="primary-btn">
+          Search Orders
+        </button>
+
+        <!-- PRODUCT CARD -->
+        <div
+          class="product-card"
+          data-test="product-card"
+        >
+
+          <h3>
+            iPhone 15 Pro
+          </h3>
+
+          <p>
+            256GB • Titanium Blue
+          </p>
+
+          <span class="badge">
+            Bestseller
+          </span>
+
+        </div>
+
+        <!-- TABLE -->
+        <table id="ordersTable">
+
+          <thead>
+
+            <tr>
+              <th>Order ID</th>
+              <th>Customer</th>
+              <th>Status</th>
+            </tr>
+
+          </thead>
+
+          <tbody>
+
+            <tr>
+              <td>#1001</td>
+              <td>Nivetha</td>
+              <td>Delivered</td>
+            </tr>
+
+            <tr>
+              <td>#1002</td>
+              <td>John</td>
+              <td>Pending</td>
+            </tr>
+
+          </tbody>
+
+        </table>
+
+        <!-- BADGES -->
+        <div class="badge-wrapper">
+
+          <span class="badge">
+            Electronics
+          </span>
+
+          <span class="badge">
+            Fashion
+          </span>
+
+          <span class="badge">
+            Flash Sale
+          </span>
+
+          <span class="badge">
+            AI Recommendations
+          </span>
+
+        </div>
+
+        <!-- WRAPPER -->
+        <div class="wrapper">
+
+          <section>
+
+            <article>
+
+              <input
+                id="unique-css-field-v2"
+                type="text"
+                class="css-target"
+                placeholder="Search Employee"
+                data-test="xpath-only"
+              />
+
+            </article>
+
+          </section>
+
+        </div>
+
+        <!-- XPATH TARGET -->
+        <div
+          class="xpath-box"
+          data-test="xpath-only"
+        >
+          XPath Target Retail Element
+        </div>
+
+        <input
+          id="hiddenRetailField"
+          class="hidden"
+          value="retail-secret"
+        />
+
+      </div>
+
+    </div>
+
+  </div>
+
+  <script>
+
+    document
+      .getElementById('placeOrderBtn')
+      .addEventListener('click', () => {
+
+        alert('Order Placed Successfully');
+
+      });
+
+    document
+      .getElementById('cancelOrderBtn')
+      .addEventListener('click', () => {
+
+        alert('Order Cancelled');
+
+      });
+
+    function addOrder(id, customer){
+
+      const row = document.createElement('tr');
+
+      row.innerHTML = `
+        <td>${id}</td>
+        <td>${customer}</td>
+        <td>Processing</td>
+      `;
+
+      document
+        .querySelector('#ordersTable tbody')
+        .appendChild(row);
+
+    }
+
+    setTimeout(() => {
+
+      const btn = document.createElement('button');
+
+      btn.id = 'delayedRetailBtn';
+
+      btn.innerText = 'Load More Products';
+
+      btn.className = 'primary-btn';
+
+      document.body.appendChild(btn);
+
+    }, 3000);
+
+  </script>
+
+</body>
+
+</html>
+<!-- LOCATOR TESTING SECTION -->
+
+<div
+  id="locatorTestZone"
+  class="wrapper"
+  data-test="locator-zone"
+>
+
+  <h3>
+    Locator Testing Playground
+  </h3>
+
+  <!-- ADJACENT SIBLING -->
+
+  <div class="locator-row">
+
+    <label id="adjacentLabel">
+      Adjacent Label
+    </label>
+
+    <input
+      id="adjacentInput"
+      class="locator-input adjacent-target"
+      type="text"
+      placeholder="Adjacent Target"
+      data-test="adjacent-input"
+    />
+
+  </div>
+
+  <!-- GENERAL SIBLING -->
+
+  <div class="locator-row">
+
+    <label id="generalLabel">
+      General Label
+    </label>
+
+    <span>Spacer</span>
+
+    <span>Spacer</span>
+
+    <input
+      id="generalInput"
+      class="locator-input general-target"
+      type="text"
+      placeholder="General Target"
+      data-test="general-input"
+    />
+
+  </div>
+
+  <!-- MULTI ATTRIBUTE -->
+
+  <div
+    id="multiAttributeContainer"
+    data-region="checkout"
+  >
+
+    <input
+      id="multiAttrInput"
+      class="locator-input"
+      type="text"
+      name="employee"
+      data-test="multi-attribute"
+      placeholder="Multi Attribute"
+    />
+
+  </div>
+
+  <!-- ANCESTOR TEST -->
+
+  <section
+    id="ancestorSection"
+    data-test="ancestor-section"
+  >
+
+    <article
+      id="ancestorArticle"
+    >
+
+      <div
+        id="ancestorWrapper"
+      >
+
+        <input
+          id="ancestorInput"
+          class="locator-input"
+          type="text"
+          placeholder="Ancestor Target"
+        />
+
+      </div>
+
+    </article>
+
+  </section>
+
+  <!-- TEXT LOCATORS -->
+
+  <button
+    id="exactTextBtn"
+    class="primary-btn"
+  >
+    Submit Order
+  </button>
+
+  <button
+    id="containsTextBtn"
+    class="secondary-btn"
+  >
+    Submit Employee Request
+  </button>
+
+  <!-- NTH CHILD TEST -->
+
+  <div
+    id="nthChildContainer"
+    class="badge-wrapper"
+  >
+
+    <span
+      class="badge nth-badge"
+    >
+      First Badge
+    </span>
+
+    <span
+      class="badge nth-badge"
+    >
+      Second Badge
+    </span>
+
+    <span
+      class="badge nth-badge"
+    >
+      Third Badge
+    </span>
+
+  </div>
+
+  <!-- STARTS WITH -->
+
+  <input
+    id="employee_dynamic_123"
+    class="locator-input"
+    type="text"
+    placeholder="Starts With Target"
+  />
+
+  <!-- ENDS WITH -->
+
+  <input
+    id="123_end_locator"
+    class="locator-input"
+    type="text"
+    placeholder="Ends With Target"
+  />
+
+  <!-- UNIQUE TEST ID -->
+
+  <input
+    id="playwrightTestIdInput"
+    data-testid="employee-search"
+    type="text"
+    placeholder="Playwright Test Id"
+  />
+
+  <!-- ROLE + NAME -->
+
+  <button
+    id="roleButton"
+    aria-label="Generate Report"
+    class="primary-btn"
+  >
+    Generate Report
+  </button>
+
+</div>
+.locator-row{
+  margin-top:20px;
+}
+
+.locator-input{
+  margin-top:8px;
+}

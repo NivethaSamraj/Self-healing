@@ -1,0 +1,1767 @@
+import { Locator, Page } from '@playwright/test';
+
+export async function buildSmartLocatorBundle(
+  locator: Locator,
+  elementName: string
+) {
+
+  const meta =
+    await extractElementMeta(
+      locator
+    );
+
+  const smartLocators =
+    await generateSmartLocators(
+      locator.page(),
+      meta
+    );
+
+  return {
+    elementName,
+    meta,
+    smartLocators,
+    timestamp:
+      new Date()
+        .toISOString()
+  };
+}
+
+async function generateAncestorXpath(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
+
+  if (!meta.ancestors?.length) {
+    return undefined;
+  }
+
+  for (const ancestor of meta.ancestors) {
+
+    const anchors = [
+      {
+        attr: 'aria-label',
+        value: ancestor.ariaLabel
+      },
+      {
+        attr: 'name',
+        value: ancestor.name
+      },
+      {
+        attr: 'id',
+        value: ancestor.id
+      }
+    ];
+
+    for (const anchor of anchors) {
+
+      if (
+        !anchor.value ||
+        !isCleanValue(
+          anchor.value,
+          anchor.attr
+        )
+      ) {
+        continue;
+      }
+
+      let xp: string | undefined;
+
+      if (
+        meta.name &&
+        isCleanValue(
+          meta.name,
+          'name'
+        )
+      ) {
+
+        xp =
+          anchor.attr === 'id'
+            ? `//*[@id="${anchor.value}"]//${meta.tag}[@name="${meta.name}"]`
+            : `//*[@${anchor.attr}="${anchor.value}"]//${meta.tag}[@name="${meta.name}"]`;
+
+      } else if (
+        meta.placeholder &&
+        isCleanValue(
+          meta.placeholder,
+          'placeholder'
+        )
+      ) {
+
+        xp =
+          anchor.attr === 'id'
+            ? `//*[@id="${anchor.value}"]//${meta.tag}[@placeholder="${meta.placeholder}"]`
+            : `//*[@${anchor.attr}="${anchor.value}"]//${meta.tag}[@placeholder="${meta.placeholder}"]`;
+
+      } else {
+
+        xp =
+          anchor.attr === 'id'
+            ? `//*[@id="${anchor.value}"]//${meta.tag}`
+            : `//*[@${anchor.attr}="${anchor.value}"]//${meta.tag}`;
+      }
+
+      if (!isStableXpath(xp)) {
+        continue;
+      }
+
+      if (
+        await isUniqueXpath(
+          page,
+          xp
+        )
+      ) {
+        return xp;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+
+async function generateScopedCss(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
+
+  if (
+    !meta.ancestors?.length ||
+    !meta.name
+  ) {
+    return undefined;
+  }
+
+  for (
+    const ancestor
+    of meta.ancestors
+  ) {
+
+    if (
+      ancestor.ariaLabel &&
+      isCleanValue(
+        ancestor.ariaLabel,
+        'aria-label'
+      )
+    ) {
+
+      const css =
+        `[aria-label="${ancestor.ariaLabel}"] ${meta.tag}[name="${meta.name}"]`;
+
+      if (
+        await isUniqueCss(
+          page,
+          css
+        )
+      ) {
+
+        return css;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+export async function extractElementMeta(
+  locator: Locator
+) {
+
+  return locator.evaluate((el) => {
+
+    function getAncestorChain(
+      element: Element,
+      depth: number = 5
+    ) {
+
+      const ancestors: any[] = [];
+
+      let current =
+        element.parentElement;
+
+      while (
+        current &&
+        ancestors.length < depth
+      ) {
+
+        ancestors.push({
+          tag:
+            current.tagName.toLowerCase(),
+
+          id:
+            current.getAttribute('id'),
+
+          name:
+            current.getAttribute('name'),
+
+          ariaLabel:
+            current.getAttribute(
+              'aria-label'
+            ),
+
+          class:
+            current.getAttribute(
+              'class'
+            )
+        });
+
+        current =
+          current.parentElement;
+      }
+
+      return ancestors;
+    }
+
+    function getSiblingInfo(
+      element: Element
+    ) {
+
+      return Array.from(
+        element.parentElement?.children || []
+      )
+        .filter(
+          sibling => sibling !== element
+        )
+        .slice(0, 5)
+        .map(sibling => ({
+          tag:
+            sibling.tagName.toLowerCase(),
+
+          text:
+            sibling.textContent
+              ?.trim()
+              ?.substring(0, 100),
+
+          ariaLabel:
+            sibling.getAttribute(
+              'aria-label'
+            ),
+
+          name:
+            sibling.getAttribute(
+              'name'
+            ),
+
+          id:
+            sibling.getAttribute(
+              'id'
+            )
+        }));
+    }
+
+    return {
+
+      tag:
+        el.tagName.toLowerCase(),
+
+      text:
+        el.textContent?.trim(),
+
+      ancestors:
+        getAncestorChain(el),
+
+      siblings:
+        getSiblingInfo(el),
+
+      id:
+        el.getAttribute('id'),
+
+      class:
+        el.getAttribute('class'),
+
+      name:
+        el.getAttribute('name'),
+
+      type:
+        el.getAttribute('type'),
+
+      placeholder:
+        el.getAttribute(
+          'placeholder'
+        ),
+
+      label:
+        el.getAttribute(
+          'aria-label'
+        ),
+
+      role:
+        el.getAttribute(
+          'role'
+        ),
+
+      alt:
+        el.getAttribute(
+          'alt'
+        ),
+
+      title:
+        el.getAttribute(
+          'title'
+        ),
+
+      testId:
+        el.getAttribute(
+          'data-testid'
+        ),
+
+      dataTest:
+        el.getAttribute(
+          'data-test'
+        ),
+
+      value:
+        el.getAttribute(
+          'value'
+        ),
+
+      outerHTML:
+        el.outerHTML
+    };
+  });
+}
+
+export function containsDynamicId(
+  xpath: string
+): boolean {
+
+  const matches =
+    xpath.match(
+      /['"]([^'"]+)['"]/g
+    );
+
+  if (!matches) {
+    return false;
+  }
+
+  return matches.some(m =>
+    isLikelyDynamicValue(
+      m.replace(
+        /['"]/g,
+        ''
+      )
+    )
+  );
+}
+
+/**
+ * Reject:
+ * //input[1]
+ * //div[2]
+ * ancestor::div[3]
+ * following::input[1]
+ */
+
+export function containsXPathIndex(
+  xpath: string
+): boolean {
+
+  return /\[\d+\]/.test(xpath);
+}
+
+/**
+ * Reject positional XPath logic
+ */
+
+export function containsPositionalXPath(
+  xpath: string
+): boolean {
+
+  return (
+    /\[\d+\]/.test(xpath) ||
+    /position\s*\(/i.test(xpath) ||
+    /last\s*\(/i.test(xpath)
+  );
+}
+
+
+export function isStableXpath(
+  xpath: string
+): boolean {
+
+  if (
+    containsDynamicId(xpath)
+  ) {
+
+    console.log(
+      `REJECTED DYNAMIC XPATH: ${xpath}`
+    );
+
+    return false;
+  }
+
+  if (
+    containsPositionalXPath(xpath)
+  ) {
+
+    console.log(
+      `REJECTED INDEXED XPATH: ${xpath}`
+    );
+
+    return false;
+  }
+
+  return true;
+}
+
+
+type SmartLocatorResult = {
+  role?: string;
+  testId?: string;
+  label?: string;
+  placeholder?: string;
+  text?: string;
+  alt?: string;
+  title?: string;
+  css?: string;
+  xpath?: string;
+};
+
+async function isUniqueAlt(
+  page: Page,
+  alt: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByAltText(
+          alt,
+          { exact: true }
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+async function isUniqueTitle(
+  page: Page,
+  title: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByTitle(
+          title,
+          { exact: true }
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+function isLikelyDynamicValue(
+  value: string,
+  attr?: string
+): boolean {
+
+  const v = value.trim();
+
+  // UUID
+
+  if (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}/i.test(v)
+  ) {
+    return true;
+  }
+
+  // Random IDs
+
+  if (
+    /^[A-Za-z0-9_-]{20,}$/.test(v) &&
+    /[A-Z]/.test(v) &&
+    /[a-z]/.test(v) &&
+    /\d/.test(v)
+  ) {
+    return true;
+  }
+
+  // Mixed random string
+
+  if (
+    /[A-Z]/.test(v) &&
+    /[a-z]/.test(v) &&
+    /\d/.test(v) &&
+    v.length > 15
+  ) {
+    return true;
+  }
+
+  // React / Angular / Material
+
+  if (
+    /(react|mui|mat|cdk|ng)/i.test(v) &&
+    /\d/.test(v)
+  ) {
+    return true;
+  }
+
+  // Ends with large number
+
+  if (
+    /[-_]\d{3,}$/.test(v)
+  ) {
+    return true;
+  }
+
+  // Long hashes
+
+  if (
+    /[0-9a-f]{8,}/i.test(v)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function isCleanValue(
+  value: string,
+  attr?: string
+): boolean {
+
+  const t = value.trim();
+
+  if (!t) {
+    return false;
+  }
+
+  const attribute =
+    attr?.toLowerCase() || '';
+
+  // =====================================
+  // DYNAMIC VALUE DETECTION
+  // =====================================
+
+  if (
+    isLikelyDynamicValue(
+      t,
+      attribute
+    )
+  ) {
+    return false;
+  }
+
+  // =====================================
+  // HUMAN READABLE ATTRIBUTES
+  // =====================================
+
+  if (
+    [
+      'aria-label',
+      'placeholder',
+      'title',
+      'alt'
+    ].includes(attribute)
+  ) {
+
+    if (t.length > 120) {
+      return false;
+    }
+
+    return true;
+  }
+
+  // =====================================
+  // ID / NAME / TEST ATTRIBUTES
+  // =====================================
+
+  if (
+    [
+      'id',
+      'name',
+      'data-testid',
+      'data-test'
+    ].includes(attribute)
+  ) {
+
+    if (t.length > 60) {
+      return false;
+    }
+
+    return true;
+  }
+
+  // =====================================
+  // DEFAULT RULES
+  // =====================================
+
+  if (t.length > 60) {
+    return false;
+  }
+
+  return true;
+}
+
+async function isUniquePlaceholder(
+  page: Page,
+  value: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByPlaceholder(
+          value
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+async function isUniqueLabel(
+  page: Page,
+  label: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByLabel(label, {
+          exact: true
+        })
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+async function isUniqueText(
+  page: Page,
+  text: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByText(
+          text,
+          { exact: true }
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+export async function generateSmartLocators(
+  page: Page,
+  meta: any
+): Promise<SmartLocatorResult> {
+
+  const locators: SmartLocatorResult = {};
+
+  // =====================================================
+  // ROLE
+  // =====================================================
+
+  const role = inferRole(meta);
+  const name = getAccessibleName(meta);
+
+  if (
+    role &&
+    name &&
+    isCleanValue(name, 'aria-label') &&
+    await isUniqueRole(page, role, name)
+  ) {
+
+    locators.role =
+      `getByRole('${role}', { name: '${escapeLocatorValue(name)}', exact: true })`;
+  }
+
+  // =====================================================
+  // TEST ID
+  // =====================================================
+
+  if (
+    meta.testId &&
+    isCleanValue(
+      meta.testId,
+      'data-testid'
+    )
+  ) {
+
+    const count =
+      await page
+        .getByTestId(meta.testId)
+        .count();
+
+    if (count === 1) {
+
+      locators.testId =
+        `getByTestId('${escapeLocatorValue(meta.testId)}')`;
+    }
+  }
+
+  // =====================================================
+  // LABEL
+  // =====================================================
+
+  if (
+    meta.label &&
+    isCleanValue(
+      meta.label,
+      'aria-label'
+    ) &&
+    await isUniqueLabel(
+      page,
+      meta.label
+    )
+  ) {
+
+    locators.label =
+      `getByLabel('${escapeLocatorValue(meta.label)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // PLACEHOLDER
+  // =====================================================
+
+  if (
+    meta.placeholder &&
+    isCleanValue(
+      meta.placeholder,
+      'placeholder'
+    ) &&
+    await isUniquePlaceholder(
+      page,
+      meta.placeholder
+    )
+  ) {
+
+    locators.placeholder =
+      `getByPlaceholder('${escapeLocatorValue(meta.placeholder)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // TEXT
+  // =====================================================
+
+  if (
+    meta.text &&
+    meta.text.length < 80 &&
+    !isLikelyDynamicValue(meta.text) &&
+    await isUniqueText(
+      page,
+      meta.text
+    )
+  ) {
+
+    locators.text =
+      `getByText('${escapeLocatorValue(meta.text)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // ALT
+  // =====================================================
+
+  if (
+    meta.alt &&
+    isCleanValue(
+      meta.alt,
+      'alt'
+    ) &&
+    await isUniqueAlt(
+      page,
+      meta.alt
+    )
+  ) {
+
+    locators.alt =
+      `getByAltText('${escapeLocatorValue(meta.alt)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // TITLE
+  // =====================================================
+
+  if (
+    meta.title &&
+    isCleanValue(
+      meta.title,
+      'title'
+    ) &&
+    await isUniqueTitle(
+      page,
+      meta.title
+    )
+  ) {
+
+    locators.title =
+      `getByTitle('${escapeLocatorValue(meta.title)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // CSS
+  // =====================================================
+
+  locators.css =
+    locators.css =
+    await generateStableCss(
+      page,
+      meta
+    );
+
+  if (!locators.css) {
+    await generateScopedCss(
+      page,
+      meta
+    );
+
+  }
+
+  // =====================================================
+  // XPATH
+  // =====================================================
+
+  locators.xpath =
+    await generateStableXpath(
+      page,
+      meta
+    );
+
+  if (!locators.xpath) {
+
+    await generateAncestorXpath(
+      page,
+      meta
+    );
+  }
+  return locators;
+}
+
+function escapeLocatorValue(
+  value: string
+): string {
+
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'");
+}
+
+async function isUniqueXpath(
+  page: Page,
+  xpath: string
+): Promise<boolean> {
+
+  if (!isStableXpath(xpath)) {
+    return false;
+  }
+
+  try {
+
+    const count =
+      await page
+        .locator(`xpath=${xpath}`)
+        .count();
+
+    return count === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+async function generateStableCss(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
+
+  const candidates = [
+
+    {
+      attr: 'data-testid',
+      value: meta.testId
+    },
+
+    {
+      attr: 'data-test',
+      value: meta.dataTest
+    },
+
+    {
+      attr: 'aria-label',
+      value: meta.label
+    },
+
+    {
+      attr: 'placeholder',
+      value: meta.placeholder
+    },
+
+    {
+      attr: 'name',
+      value: meta.name
+    },
+
+    {
+      attr: 'title',
+      value: meta.title
+    },
+
+    {
+      attr: 'alt',
+      value: meta.alt
+    },
+
+    {
+      attr: 'id',
+      value: meta.id
+    }
+  ];
+
+  for (const candidate of candidates) {
+
+    if (
+      !candidate.value ||
+      !isCleanValue(
+        candidate.value,
+        candidate.attr
+      )
+    ) {
+      continue;
+    }
+
+    const selector =
+      candidate.attr === 'id'
+        ? `#${candidate.value}`
+        : `${meta.tag}[${candidate.attr}="${candidate.value}"]`;
+
+    if (
+      await isUniqueCss(
+        page,
+        selector
+      )
+    ) {
+      return selector;
+    }
+  }
+
+  if (meta.class) {
+
+    const stableClass =
+      meta.class
+        .split(' ')
+        .find(
+          (c: string) =>
+            isCleanValue(
+              c,
+              'class'
+            )
+        );
+
+    if (stableClass) {
+
+      const selector =
+        `${meta.tag}.${stableClass}`;
+
+      if (
+        await isUniqueCss(
+          page,
+          selector
+        )
+      ) {
+        return selector;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+async function isUniqueRole(
+  page: Page,
+  role: string,
+  name: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByRole(
+          role as any,
+          {
+            name,
+            exact: true
+          }
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+async function generateStableXpath(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
+
+  const candidates: string[] = [];
+
+  if (
+    meta.testId &&
+    isCleanValue(
+      meta.testId,
+      'data-testid'
+    )
+  ) {
+
+    candidates.push(
+      `//*[@data-testid="${meta.testId}"]`
+    );
+  }
+
+  if (
+    meta.dataTest &&
+    isCleanValue(
+      meta.dataTest,
+      'data-test'
+    )
+  ) {
+
+    candidates.push(
+      `//*[@data-test="${meta.dataTest}"]`
+    );
+  }
+
+  if (
+    meta.name &&
+    isCleanValue(
+      meta.name,
+      'name'
+    )
+  ) {
+
+    candidates.push(
+      `//${meta.tag}[@name="${meta.name}"]`
+    );
+  }
+
+  if (
+    meta.label &&
+    isCleanValue(
+      meta.label,
+      'aria-label'
+    )
+  ) {
+
+    candidates.push(
+      `//${meta.tag}[@aria-label="${meta.label}"]`
+    );
+  }
+
+  if (
+    meta.placeholder &&
+    isCleanValue(
+      meta.placeholder,
+      'placeholder'
+    )
+  ) {
+
+    candidates.push(
+      `//${meta.tag}[@placeholder="${meta.placeholder}"]`
+    );
+  }
+
+  if (
+    meta.title &&
+    isCleanValue(
+      meta.title,
+      'title'
+    )
+  ) {
+
+    candidates.push(
+      `//${meta.tag}[@title="${meta.title}"]`
+    );
+  }
+
+  if (
+    meta.alt &&
+    isCleanValue(
+      meta.alt,
+      'alt'
+    )
+  ) {
+
+    candidates.push(
+      `//${meta.tag}[@alt="${meta.alt}"]`
+    );
+  }
+
+  if (
+    meta.id &&
+    isCleanValue(
+      meta.id,
+      'id'
+    )
+  ) {
+
+    candidates.push(
+      `//*[@id="${meta.id}"]`
+    );
+  }
+
+  for (const xp of candidates) {
+
+    if (!isStableXpath(xp)) {
+      continue;
+    }
+
+    if (
+      await isUniqueXpath(
+        page,
+        xp
+      )
+    ) {
+
+      return xp;
+    }
+  }
+
+  return undefined;
+}
+async function isUniqueCss(
+  page: Page,
+  selector: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .locator(selector)
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+
+function inferRole(meta: any): string | null {
+
+  /**
+   * USE EXPLICIT ROLE FIRST
+   */
+
+  if (meta.role) {
+    return meta.role;
+  }
+
+  const tag =
+    meta.tag?.toLowerCase();
+
+  const type =
+    meta.type?.toLowerCase();
+
+  switch (tag) {
+
+    /**
+     * BUTTON
+     */
+
+    case 'button':
+      return 'button';
+
+    /**
+     * LINK
+     */
+
+    case 'a':
+      return 'link';
+
+    /**
+     * INPUT TYPES
+     */
+
+    case 'input':
+
+      switch (type) {
+
+        case 'button':
+        case 'submit':
+        case 'reset':
+          return 'button';
+
+        case 'checkbox':
+          return 'checkbox';
+
+        case 'radio':
+          return 'radio';
+
+        case 'email':
+        case 'text':
+        case 'password':
+        case 'search':
+        case 'tel':
+        case 'url':
+        case 'number':
+          return 'textbox';
+
+        case 'range':
+          return 'slider';
+
+        case 'file':
+          return 'button';
+
+        default:
+          return 'textbox';
+      }
+
+    /**
+     * SELECT
+     */
+
+    case 'select':
+      return 'combobox';
+
+    /**
+     * TEXTAREA
+     */
+
+    case 'textarea':
+      return 'textbox';
+
+    /**
+     * IMAGE
+     */
+
+    case 'img':
+      return 'img';
+
+    default:
+      return null;
+  }
+}
+
+function getAccessibleName(
+  meta: any
+): string | null {
+
+  return (
+    meta.label ||
+    meta.placeholder ||
+    meta.alt ||
+    meta.text ||
+    meta.title ||
+    meta.name ||
+    null
+  );
+}
+
+export async function captureElementScreenshot(locator: Locator): Promise<Buffer> {
+  const page = locator.page();
+
+  try {
+    const container = locator.locator(
+      'xpath=ancestor::*[contains(@class,"form") or contains(@class,"field") or contains(@class,"group")][1]'
+    );
+
+    if (await container.first().isVisible().catch(() => false)) {
+      return await container.first().screenshot({ type: 'jpeg', quality: 70 });
+    }
+
+    const id = await locator.getAttribute('id');
+    if (id) {
+      const label = page.locator(`label[for="${id}"]`);
+      if (await label.first().isVisible().catch(() => false)) {
+        const wrapper = label.locator('xpath=ancestor::*[1]');
+        return await wrapper.first().screenshot({ type: 'jpeg', quality: 70 });
+      }
+    }
+
+    const ariaLabelledBy = await locator.getAttribute('aria-labelledby');
+    if (ariaLabelledBy) {
+      const label = page.locator(`#${ariaLabelledBy}`);
+      if (await label.first().isVisible().catch(() => false)) {
+        const wrapper = label.locator('xpath=ancestor::*[1]');
+        return await wrapper.first().screenshot({ type: 'jpeg', quality: 70 });
+      }
+    }
+
+    const ancestor = locator.locator('xpath=ancestor::div[1]');
+    if (await ancestor.first().isVisible().catch(() => false)) {
+      return await ancestor.first().screenshot({ type: 'jpeg', quality: 70 });
+    }
+
+    return await locator.screenshot({ type: 'jpeg', quality: 70 });
+
+  } catch {
+    return await locator.screenshot({ type: 'jpeg', quality: 70 });
+  }
+}
+
+
+export async function captureFullPageScreenshot(page: Page): Promise<Buffer> {
+  return await page.screenshot({
+    fullPage: true,
+    type: 'jpeg',
+    quality: 70, // reduce size
+  });
+}
+
+
+export async function getElementOuterHTML(locator: Locator): Promise<string> {
+  return await locator.evaluate((el) => {
+    const clone = el.cloneNode(true) as HTMLElement;
+
+    // Remove noisy attributes
+    clone.removeAttribute('style');
+
+    [...clone.attributes].forEach(attr => {
+      if (attr.name.startsWith('data-')) {
+        clone.removeAttribute(attr.name);
+      }
+    });
+
+    return clone.outerHTML;
+  });
+}
+
+export async function getMinimalFullDOM(
+  page: Page,
+  maxLength: number = 15000
+): Promise<string> {
+
+  return await page.evaluate((maxLength) => {
+
+    // Clone body to avoid modifying real DOM
+    const clone = document.body.cloneNode(true) as HTMLElement;
+
+    // =========================================
+    // REMOVE NOISE ELEMENTS
+    // =========================================
+
+    clone.querySelectorAll(`
+      script,
+      style,
+      noscript,
+      head,
+      svg,
+      picture,
+      video,
+      img,
+      iframe,
+      canvas,
+      link,
+      meta,
+      source,
+      track,
+      audio
+    `).forEach(el => el.remove());
+
+    // =========================================
+    // REMOVE HIDDEN ELEMENTS
+    // =========================================
+
+    clone.querySelectorAll(`
+      .hidden,
+      [hidden],
+      input[type="hidden"],
+      [aria-hidden="true"]
+    `).forEach(el => el.remove());
+
+    // =========================================
+    // REMOVE COMMENTS
+    // =========================================
+
+    const walker = document.createTreeWalker(
+      clone,
+      NodeFilter.SHOW_COMMENT
+    );
+
+    const comments: Comment[] = [];
+
+    let node;
+
+    while ((node = walker.nextNode())) {
+      comments.push(node as Comment);
+    }
+
+    comments.forEach(comment => {
+      comment.parentNode?.removeChild(comment);
+    });
+
+    // =========================================
+    // REMOVE DYNAMIC / NOISY ATTRIBUTES
+    // =========================================
+
+    const cleanAttributes = (el: Element) => {
+
+      [...el.attributes].forEach(attr => {
+
+        const attrName = attr.name.toLowerCase();
+
+        if (
+          attrName.startsWith('data-') ||
+          attrName === 'style' ||
+          attrName === 'onclick' ||
+          attrName === 'onchange' ||
+          attrName === 'onmouseover' ||
+          attrName === 'onfocus' ||
+          attrName === 'tabindex'
+        ) {
+          el.removeAttribute(attr.name);
+        }
+
+        // Remove dynamic IDs
+        if (
+          attrName === 'id' &&
+          /^[a-zA-Z0-9_-]{20,}$/.test(attr.value)
+        ) {
+          el.removeAttribute('id');
+        }
+
+        // Remove long dynamic classes
+        if (
+          attrName === 'class' &&
+          attr.value.length > 200
+        ) {
+          el.removeAttribute('class');
+        }
+      });
+
+      Array.from(el.children).forEach(child => {
+        cleanAttributes(child);
+      });
+    };
+
+    cleanAttributes(clone);
+
+    // =========================================
+    // NORMALIZE WHITESPACE
+    // =========================================
+
+    let html = clone.innerHTML
+      .replace(/\s+/g, ' ')
+      .replace(/>\s+</g, '><')
+      .trim();
+
+    // =========================================
+    // LIMIT SIZE
+    // =========================================
+
+    if (html.length > maxLength) {
+      html = html.slice(0, maxLength);
+    }
+
+    return html;
+
+  }, maxLength);
+}
+
+
+// export async function getElementContextDOM(
+//   locator: Locator,
+//   parentDepth: number = 5,
+//   siblingCount: number = 2,
+//   descendantDepth: number = 2
+// ): Promise<string> {
+
+//   return await locator.evaluate(
+//     (
+//       el,
+//       { parentDepth, siblingCount, descendantDepth }
+//     ) => {
+
+//       function cleanHTML(node: Element): string {
+//         return node.outerHTML
+//           .replace(/\s+/g, ' ')
+//           .trim();
+//       }
+
+//       function getParents(element: Element, depth: number): string[] {
+//         const parents: string[] = [];
+
+//         let current = element.parentElement;
+
+//         while (current && depth > 0) {
+//           parents.push(cleanHTML(current));
+//           current = current.parentElement;
+//           depth--;
+//         }
+
+//         return parents.reverse();
+//       }
+
+//       function getSiblings(element: Element, count: number): string[] {
+
+//         const siblings: string[] = [];
+
+//         let prev = element.previousElementSibling;
+//         let next = element.nextElementSibling;
+
+//         let added = 0;
+
+//         while (prev && added < count) {
+//           siblings.push(cleanHTML(prev));
+//           prev = prev.previousElementSibling;
+//           added++;
+//         }
+
+//         added = 0;
+
+//         while (next && added < count) {
+//           siblings.push(cleanHTML(next));
+//           next = next.nextElementSibling;
+//           added++;
+//         }
+
+//         return siblings;
+//       }
+
+//       function getDescendants(
+//         element: Element,
+//         depth: number
+//       ): string[] {
+
+//         const results: string[] = [];
+
+//         function walk(node: Element, currentDepth: number) {
+
+//           if (currentDepth > depth) return;
+
+//           for (const child of Array.from(node.children)) {
+
+//             results.push(cleanHTML(child));
+
+//             walk(child as Element, currentDepth + 1);
+//           }
+//         }
+
+//         walk(element, 1);
+
+//         return results;
+//       }
+
+//       return JSON.stringify({
+//         target: cleanHTML(el),
+//         parents: getParents(el, parentDepth),
+//         siblings: getSiblings(el, siblingCount),
+//         descendants: getDescendants(el, descendantDepth),
+//       });
+//     },
+//     {
+//       parentDepth,
+//       siblingCount,
+//       descendantDepth,
+//     }
+//   );
+// }
+
+export async function getElementContextDOM(
+  locator: Locator,
+  parentDepth: number = 5,
+  siblingCount: number = 2,
+  descendantDepth: number = 2
+): Promise<string> {
+
+  return await locator.evaluate(
+    (
+      el,
+      {
+        parentDepth,
+        siblingCount,
+        descendantDepth
+      }
+    ) => {
+
+      function cleanHTML(
+        node: Element
+      ): string {
+
+        return node.outerHTML
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      function getAncestors(
+        element: Element,
+        depth: number
+      ): string[] {
+
+        const ancestors: string[] = [];
+
+        let current =
+          element.parentElement;
+
+        while (
+          current &&
+          depth > 0
+        ) {
+
+          ancestors.push(
+            cleanHTML(current)
+          );
+
+          current =
+            current.parentElement;
+
+          depth--;
+        }
+
+        return ancestors;
+      }
+
+      function getSiblings(
+        element: Element,
+        count: number
+      ): string[] {
+
+        const siblings: string[] = [];
+
+        let prev =
+          element.previousElementSibling;
+
+        let next =
+          element.nextElementSibling;
+
+        let added = 0;
+
+        while (
+          prev &&
+          added < count
+        ) {
+
+          siblings.push(
+            cleanHTML(prev)
+          );
+
+          prev =
+            prev.previousElementSibling;
+
+          added++;
+        }
+
+        added = 0;
+
+        while (
+          next &&
+          added < count
+        ) {
+
+          siblings.push(
+            cleanHTML(next)
+          );
+
+          next =
+            next.nextElementSibling;
+
+          added++;
+        }
+
+        return siblings;
+      }
+
+      function getDescendants(
+        element: Element,
+        depth: number
+      ): string[] {
+
+        const results: string[] = [];
+
+        function walk(
+          node: Element,
+          currentDepth: number
+        ) {
+
+          if (
+            currentDepth > depth
+          ) {
+            return;
+          }
+
+          for (
+            const child of
+            Array.from(
+              node.children
+            )
+          ) {
+
+            results.push(
+              cleanHTML(child)
+            );
+
+            walk(
+              child as Element,
+              currentDepth + 1
+            );
+          }
+        }
+
+        walk(element, 1);
+
+        return results;
+      }
+
+      const target =
+        cleanHTML(el);
+
+      const ancestors =
+        getAncestors(
+          el,
+          parentDepth
+        );
+
+      const siblings =
+        getSiblings(
+          el,
+          siblingCount
+        );
+
+      const descendants =
+        getDescendants(
+          el,
+          descendantDepth
+        );
+
+      return `
+TARGET:
+${target}
+
+ANCESTORS:
+${ancestors.join('\n')}
+
+SIBLINGS:
+${siblings.join('\n')}
+
+DESCENDANTS:
+${descendants.join('\n')}
+      `.trim();
+    },
+    {
+      parentDepth,
+      siblingCount,
+      descendantDepth
+    }
+  );
+}

@@ -1,0 +1,141 @@
+<div id="healing-playground">
+
+    <h2>Locator Healing Playground</h2>
+
+    <section>
+
+        <article>
+
+            <div>
+
+                <h4>Monthly Revenue</h4>
+
+                <div>
+                    <input />
+                </div>
+
+            </div>
+
+        </article>
+
+    </section>
+
+    <div>
+
+        <label>Employee Section</label>
+
+        <input />
+
+    </div>
+    <div>
+
+        <label>Payroll Entry</label>
+
+        <span>Spacer 1</span>
+
+        <span>Spacer 2</span>
+
+        <input />
+
+    </div>
+    <div>
+
+        <input />
+
+        <span>Inventory Buffer</span>
+
+    </div>
+
+    <table border="1">
+
+        <tr>
+
+            <td>Salary</td>
+
+            <td>
+                <input />
+            </td>
+
+        </tr>
+
+    </table>
+
+    <section>
+
+        <article>
+
+            <div>
+
+                <ul>
+
+                    <li>
+
+                        <span>Product Matrix</span>
+
+                    </li>
+
+                </ul>
+
+                <div>
+
+                    <input />
+
+                </div>
+
+            </div>
+
+        </article>
+
+    </section>
+
+    <div>
+
+        <span>Finance</span>
+
+        <input />
+
+    </div>
+    <div>
+
+        <span>Status</span>
+
+        <input />
+
+    </div>
+
+    <div>
+
+        <span>Status</span>
+
+        <input />
+
+    </div>
+
+    <div id="dynamic-area"></div>
+
+</div>
+
+<script>
+
+    setTimeout(() => {
+
+        const span =
+            document.createElement('span');
+
+        span.textContent =
+            'Delayed Locator';
+
+        const input =
+            document.createElement('input');
+
+        document
+            .getElementById('dynamic-area')
+            .appendChild(span);
+
+        document
+            .getElementById('dynamic-area')
+            .appendChild(input);
+
+    }, 3000);
+
+</script>
