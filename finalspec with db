@@ -1,0 +1,293 @@
+import { test, expect, Page, Locator } from '@playwright/test';
+import * as path from 'path';
+import { pathToFileURL } from 'url';
+import { saveElement } from '../db/elementRepo';
+import {
+  buildSmartLocatorBundle,
+  captureElementScreenshot,
+  captureFullPageScreenshot,
+  getElementOuterHTML,
+  getMinimalFullDOM,
+} from '../selfHealing';
+
+const htmlPath = path.resolve(__dirname, '..', 'endtoend.html');
+console.log('HTML Path:', htmlPath);
+
+const STORE_URL = pathToFileURL(htmlPath).href;
+const PROMO_CODE = 'SELFHEAL123'; // intentionally invalid -> exercises the error path
+
+const PACE = { micro: 500, short: 1000, medium: 1800, long: 2600 };
+
+async function settle(page: Page, ms: number = PACE.short): Promise<void> {
+  await page.waitForTimeout(ms);
+}
+
+async function humanScroll(page: Page, pixels: number, steps = 6): Promise<void> {
+  const per = Math.round(pixels / steps);
+  for (let i = 0; i < steps; i++) {
+    await page.mouse.wheel(0, per);
+    await page.waitForTimeout(220);
+  }
+}
+
+/** Return the first visible candidate locator — the self-healing fallback core. */
+async function firstVisible(page: Page, candidates: Locator[], timeout = 8000): Promise<Locator> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    for (const c of candidates) {
+      try {
+        if (await c.first().isVisible()) return c.first();
+      } catch { /* try next */ }
+    }
+    await page.waitForTimeout(250);
+  }
+  return candidates[0].first();
+}
+
+async function safeClick(page: Page, locator: Locator, label: string): Promise<void> {
+  console.log(`➡️  ${label}`);
+  await locator.scrollIntoViewIfNeeded();
+  await settle(page, PACE.micro);
+  await locator.click();
+  await settle(page, PACE.short);
+}
+
+/**
+ * captureElement (inlined)
+ * ------------------------
+ * Snapshots everything the self-healing engine will later need for a single
+ * element, and upserts it into Postgres via saveElement().
+ *
+ * Persists: primary_locator, smart_locators, meta, outer_html,
+ * context_dom (minimal full-page DOM, used by AI healing as oldDOM),
+ * element_screenshot, full_page_screenshot.
+ *
+ * Captures the CURRENT, WORKING state — run while the flow still passes so you
+ * bank a clean baseline, then corrupt primary_locator in the DB to force the
+ * fallback / AI path. Never throws: a capture failure logs and moves on so the
+ * functional test is unaffected.
+ */
+async function captureElement(
+  page: Page,
+  elementName: string,
+  locator: Locator,
+  primaryLocatorStr: string
+): Promise<void> {
+  try {
+    await locator.first().waitFor({ state: 'visible', timeout: 8000 });
+    const target = locator.first();
+
+    // 1. Smart-locator bundle (role/testId/label/.../css/xpath) + meta.
+    const bundle = await buildSmartLocatorBundle(target, elementName);
+
+    // 2. Visual + DOM context. Each guarded so one failure never aborts capture.
+    //    context_dom holds the minimal full-page DOM (AI healing reads it as oldDOM).
+    const [elementShot, fullPageShot, outerHTML, contextDom] = await Promise.all([
+      captureElementScreenshot(target).catch(() => null),
+      captureFullPageScreenshot(page).catch(() => null),
+      getElementOuterHTML(target).catch(() => ''),
+      getMinimalFullDOM(page).catch(() => ''),
+    ]);
+
+    // 3. Persist. Field names match elementRepo.saveElement's expectations.
+    await saveElement({
+      elementName,
+      pageUrl: page.url(),
+      primaryLocator: primaryLocatorStr,
+      smartLocators: bundle.smartLocators,
+      meta: bundle.meta,
+      outerHTML,
+      context_dom: contextDom,
+      elementScreenshot: elementShot,
+      fullPageScreenshot: fullPageShot,
+    });
+
+    console.log(`💾 captured element: ${elementName}`);
+  } catch (err: any) {
+    console.warn(`⚠️  capture failed for ${elementName}: ${err?.message || err}`);
+  }
+}
+
+/** Pick the first enabled (in-stock) size swatch dynamically, and capture it. */
+async function selectFirstAvailableSize(page: Page, captureName: string): Promise<void> {
+  console.log('➡️  Selecting first available size');
+  const enabledSizes = page.locator('#m-sizes .size-btn:not([disabled])');
+  await enabledSizes.first().waitFor({ state: 'visible' });
+  const target = enabledSizes.first();
+
+  // Capture the size swatch baseline before clicking.
+  await captureElement(page, captureName, target, '#m-sizes .size-btn:not([disabled])');
+
+  await target.scrollIntoViewIfNeeded();
+  await settle(page, PACE.micro);
+  await target.click();
+  await expect(target).toHaveClass(/selected/);
+  console.log('   ✓ size selected:', await target.textContent());
+  await settle(page, PACE.short);
+}
+
+async function clickAddToBag(page: Page, captureName: string): Promise<void> {
+  const addBtn = await firstVisible(page, [
+    page.getByRole('button', { name: /add to bag/i }),
+    page.locator('#add-to-bag'),
+  ]);
+  await captureElement(page, captureName, addBtn, '#add-to-bag');
+  await safeClick(page, addBtn, 'Add to Bag (red)');
+  await settle(page, PACE.medium);
+}
+
+test.describe('NovaCart mock store — checkout journey', () => {
+  test.setTimeout(120_000);
+
+  test('Shop, add two products, apply promo, checkout', async ({ page }) => {
+    // 1. Land on home page
+    console.log('\n=== STEP 1: Open store ===');
+    await page.goto(STORE_URL, { waitUntil: 'domcontentloaded' });
+    await settle(page, PACE.medium);
+    await expect(page).toHaveTitle(/NovaCart/i);
+
+    // 2. Press green "Shop Now"
+    console.log('\n=== STEP 2: Shop Now ===');
+    const shopNow = await firstVisible(page, [
+      page.getByRole('button', { name: /shop now/i }),
+      page.locator('#shop-now'),
+    ]);
+    await captureElement(page, 'shop_now_button', shopNow, '#shop-now');
+    await safeClick(page, shopNow, 'Shop Now (green)');
+
+    // 3. Scroll down a bit
+    console.log('\n=== STEP 3: Scroll ===');
+    await humanScroll(page, 700);
+    await settle(page, PACE.medium);
+
+    // 4. Open a product
+    console.log('\n=== STEP 4: Open a product ===');
+    const productOpener = await firstVisible(page, [
+      page.locator('[data-open-product]'),
+      page.locator('.product-link'),
+    ]);
+    await captureElement(page, 'product_open_link', productOpener, '.product-link');
+    await safeClick(page, productOpener, 'Open product detail');
+    await expect(page.locator('#product-overlay')).toHaveClass(/open/);
+
+    // 5 & 6. Select size + Add to Bag
+    console.log('\n=== STEP 5/6: Size & Add to Bag ===');
+    await selectFirstAvailableSize(page, 'size_swatch_first');
+    await clickAddToBag(page, 'add_to_bag_button');
+    await expect(page.locator('#cart-count')).toHaveText('1');
+
+    // 7. Continue Shopping
+    console.log('\n=== STEP 7: Continue Shopping ===');
+    const continueShopping = await firstVisible(page, [
+      page.getByRole('button', { name: /continue shopping/i }),
+      page.locator('#continue-shopping'),
+    ]);
+    await captureElement(page, 'continue_shopping_button', continueShopping, '#continue-shopping');
+    await safeClick(page, continueShopping, 'Continue Shopping');
+
+    // 8. Hover Clothing -> Tees & Knits
+    console.log('\n=== STEP 8: Clothing > Tees & Knits ===');
+    const clothing = await firstVisible(page, [
+      page.locator('.menu-item', { hasText: /^clothing/i }),
+      page.locator('[data-menu="clothing"]'),
+    ]);
+    await captureElement(page, 'clothing_menu', clothing, '[data-menu="clothing"]');
+    await clothing.scrollIntoViewIfNeeded();
+    await clothing.hover();
+    console.log('   ✓ hovered Clothing');
+    await settle(page, PACE.medium);
+
+    const teesKnits = await firstVisible(page, [
+      page.getByText(/tees\s*&?\s*knits/i),
+      page.locator('[data-nav="tees-knits"]'),
+    ]);
+    await captureElement(page, 'tees_knits_nav', teesKnits, '[data-nav="tees-knits"]');
+    await safeClick(page, teesKnits, 'Tees & Knits');
+    await expect(page.locator('#catalog-title')).toHaveText(/tees\s*&?\s*knits/i);
+    await settle(page, PACE.short);
+
+    // 9. Sort dropdown -> Rating
+    console.log('\n=== STEP 9: Sort by Rating ===');
+    const sortSelect = await firstVisible(page, [
+      page.locator('#sort-select'),
+      page.getByRole('combobox', { name: /sort/i }),
+      page.locator('select[name="sort"]'),
+    ]);
+    await captureElement(page, 'sort_select', sortSelect, '#sort-select');
+    await sortSelect.scrollIntoViewIfNeeded();
+    await settle(page, PACE.micro);
+    await sortSelect.selectOption('rating');
+    console.log('   ✓ selected Rating');
+    await settle(page, PACE.medium);
+
+    // 10. Open first product in sorted grid
+    console.log('\n=== STEP 10: Open first product ===');
+    const firstProduct = await firstVisible(page, [
+      page.locator('#product-grid [data-open-product]').first(),
+      page.locator('.product-link').first(),
+    ]);
+    await captureElement(page, 'first_sorted_product', firstProduct, '#product-grid .product-link');
+    await safeClick(page, firstProduct, 'Open first sorted product');
+    await expect(page.locator('#product-overlay')).toHaveClass(/open/);
+
+    // 11. Size + Add to Bag (2nd item)
+    console.log('\n=== STEP 11: Size & Add to Bag (2nd) ===');
+    await selectFirstAvailableSize(page, 'size_swatch_first');
+    await clickAddToBag(page, 'add_to_bag_button');
+    await expect(page.locator('#cart-count')).toHaveText('2');
+
+    // 12. View Bag & Checkout
+    console.log('\n=== STEP 12: View Bag & Checkout ===');
+    const viewBag = await firstVisible(page, [
+      page.getByRole('button', { name: /view bag.*checkout|view bag/i }),
+      page.locator('#view-bag'),
+    ]);
+    await captureElement(page, 'view_bag_button', viewBag, '#view-bag');
+    await safeClick(page, viewBag, 'View Bag & Checkout');
+    await expect(page.locator('#cart-page')).toHaveClass(/active/);
+
+    // 13. Enter promo code
+    console.log('\n=== STEP 13: Enter promo code ===');
+    const promoInput = await firstVisible(page, [
+      page.getByPlaceholder(/promo/i),
+      page.locator('#promo-input'),
+      page.locator('input[name="promoCode"]'),
+    ]);
+    await captureElement(page, 'promo_input', promoInput, '#promo-input');
+    await promoInput.scrollIntoViewIfNeeded();
+    await settle(page, PACE.micro);
+    await promoInput.fill('');
+    await promoInput.type(PROMO_CODE, { delay: 110 });
+    console.log(`   ✓ entered: ${PROMO_CODE}`);
+    await settle(page, PACE.short);
+
+    // 14. Apply promo
+    console.log('\n=== STEP 14: Apply promo ===');
+    const applyBtn = await firstVisible(page, [
+      page.getByRole('button', { name: /^apply$/i }),
+      page.locator('#apply-promo'),
+    ]);
+    await captureElement(page, 'apply_promo_button', applyBtn, '#apply-promo');
+    await safeClick(page, applyBtn, 'Apply promo');
+    await expect(page.locator('#promo-msg')).toBeVisible();
+    console.log('   ℹ️ promo result:', await page.locator('#promo-msg').textContent());
+    await settle(page, PACE.medium);
+
+    // 15. Checkout
+    console.log('\n=== STEP 15: Checkout ===');
+    const checkoutBtn = await firstVisible(page, [
+      page.getByRole('button', { name: /^checkout$/i }),
+      page.locator('#checkout-btn'),
+    ]);
+    await captureElement(page, 'checkout_button', checkoutBtn, '#checkout-btn');
+    await safeClick(page, checkoutBtn, 'Checkout');
+
+    // Confirm we reached the mock checkout success screen.
+    await expect(page.locator('#checkout-overlay')).toHaveClass(/open/);
+    await expect(page.locator('#checkout-heading')).toHaveText(/order confirmed/i);
+    console.log('\n✅ Reached checkout confirmation. Total:',
+      await page.locator('#checkout-total').textContent());
+
+    await settle(page, PACE.long);
+  });
+});
