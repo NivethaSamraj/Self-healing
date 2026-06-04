@@ -1,0 +1,89 @@
+import { chromium } from '@playwright/test';
+import * as fs from 'fs';
+
+(async () => {
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+  await page.setContent(
+    '<h1 style="font-size:80px;font-family:sans-serif">PURPLE-9173</h1>'
+  );
+  const buf = await page.screenshot({ type: 'jpeg', quality: 70 });
+  fs.writeFileSync('./probe.jpg', buf);
+  await browser.close();
+  console.log('probe.jpg written');
+})();
+
+Create make-image.ts:
+typescriptimport { chromium } from '@playwright/test';
+import * as fs from 'fs';
+
+(async () => {
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+  await page.setContent(
+    '<h1 style="font-size:80px;font-family:sans-serif">PURPLE-9173</h1>'
+  );
+  const buf = await page.screenshot({ type: 'jpeg', quality: 70 });
+  fs.writeFileSync('./probe.jpg', buf);
+  await browser.close();
+  console.log('probe.jpg written');
+})();
+Run it:
+bashnpx ts-node make-image.ts
+PURPLE-9173 is a random token that appears nowhere in your prompt — if the model returns it, the text could only have come from the pixels.
+Step 3 — Create the probe script
+Create probe-vision.ts:
+typescriptimport OpenAI from 'openai';
+import * as fs from 'fs';
+import * as dotenv from 'dotenv';
+dotenv.config({ path: '../.env' }); // points at your existing .env
+
+const client = new OpenAI({
+  apiKey: process.env.AZURE_OPENAI_API_KEY!,
+  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
+  defaultQuery: { 'api-version': '2024-02-15-preview' },
+  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_API_KEY! },
+});
+
+async function probe(attachImage: boolean) {
+  const text =
+    'Reply with ONLY the exact text written inside this image. ' +
+    'If you cannot see any image, reply exactly: NO_IMAGE';
+
+  const content: any[] = [{ type: 'text', text }];
+
+  if (attachImage) {
+    const b64 = fs.readFileSync('./probe.jpg', { encoding: 'base64' });
+    content.push({
+      type: 'image_url',
+      image_url: { url: `data:image/jpeg;base64,${b64}` },
+    });
+  }
+
+  const res = await client.chat.completions.create({
+    model: process.env.AZURE_OPENAI_DEPLOYMENT!,
+    messages: [{ role: 'user', content }],
+    temperature: 0,
+  });
+
+  console.log(`\n=== attachImage=${attachImage} ===`);
+  console.log('answer:', res.choices[0].message.content);
+  console.log('usage:', res.usage);
+}
+
+(async () => {
+  try {
+    await probe(false); // expect: NO_IMAGE
+    await probe(true);  // expect: PURPLE-9173
+  } catch (e: any) {
+    console.error('API ERROR:', e.status, e.message);
+  }
+})();
+Step 4 — Run the probe
+bashnpx ts-node probe-vision.ts
+Step 5 — Read the two outputs against this table
+attachImage=falseattachImage=trueVerdictNO_IMAGEPURPLE-9173✅ Vision works — port the content-array code into aiHealing.tsNO_IMAGENO_IMAGE❌ Deployment is text-only — swap my-gpt41 for a vision model (gpt-4o)anythingAPI ERROR 400❌ Model rejecting image blocks — non-vision model or wrong api-version
+Step 6 — Confirm with token usage
+Look at the usage line on the attachImage=true run. If vision genuinely processed the image, the prompt token count jumps noticeably versus the false run (images cost tokens). Same token count both times is another sign the image was ignored.
+Step 7 — (Optional) Test your real screenshots
+Once the synthetic probe passes, swap probe.jpg for an actual JPEG your capture produced — copy one out of the DB or call captureElementScreenshot once and write the buffer to disk. Then ask the model to describe what it sees. This catches a different failure: the plumbing is fine but your stored screenshots are empty/corrupt/blank.
