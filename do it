@@ -1,0 +1,95 @@
+Phase A — Secure the secrets first (do this before anything else)
+
+Regenerate/rotate the Azure OpenAI key in the Azure portal — the old one was shared in plain text, so treat it as compromised.
+Create a .env file in your project root with:
+
+   AZURE_OPENAI_API_KEY=your-new-key
+   AZURE_OPENAI_ENDPOINT=https://testingsl1.openai.azure.com/openai/deployments/gpt-4.1
+   AZURE_OPENAI_DEPLOYMENT=gpt-4.1
+   USE_SCREENSHOTS=true
+
+Confirm .env is in .gitignore so it never gets committed.
+
+Phase B — Apply the screenshot fix
+
+Replace your aiHealing.ts with the corrected version I gave you.
+In the Azure portal, verify your gpt-4.1 deployment is genuinely vision-capable (check the model's supported modalities). This is the single most important check — if it isn't, images are silently ignored and your whole experiment is invalid. If it's text-only, deploy a vision model (gpt-4o or gpt-4.1 vision) and point AZURE_OPENAI_DEPLOYMENT at it.
+Confirm your capture is storing screenshots as JPEG (it is, per your captureElementScreenshot), so the default mime in the fix is correct.
+
+Phase C — Bank a clean baseline
+
+Make sure USE_SCREENSHOTS=true and run capture mode once so the DB holds fresh, good rows with screenshots and DOM:
+
+   MODE=capture npx playwright test novacart-checkout.spec.ts
+
+Spot-check one row in the DB — confirm element_screenshot, full_page_screenshot, context_dom, and smart_locators are all populated.
+
+Phase D — Quick sanity check that vision now works at all
+Before the full experiment, prove the plumbing end-to-end on one element.
+
+Break one element's locators in the DB (primary + all smart locators → non-existent selectors), as we did before.
+Run heal mode:
+
+    MODE=heal npx playwright test novacart-checkout.spec.ts
+
+In the logs, confirm you see [AI] screenshots ENABLED — 3 image(s) attached and that the element healed via AI. This proves images are being sent. (It still doesn't prove they're being used — that's what Phase E measures.)
+
+Phase E — The actual experiment
+The goal is to compare healing with vs without screenshots, on cases where vision could plausibly matter.
+
+Pick your test cases deliberately. Vision can only help when an element moved or restyled but stayed unique. So bias toward those: change an element's id and class and text but keep it the single such element on the page. Avoid the ambiguous-identical-siblings case (it can't heal either way). Aim for maybe 6–10 broken elements across a couple of break-types.
+Re-capture a clean baseline (Phase C) so every run starts from the same stored state.
+Run 1 — with screenshots. Set USE_SCREENSHOTS=true, break your chosen elements, run heal mode, and record for each element: did it heal, which strategy, the AI confidence, and — critically — was the healed locator correct (did it find the right element, not just a unique one).
+Re-capture the baseline again (so Run 2 starts identical), break the same elements the same way.
+Run 2 — without screenshots. Set USE_SCREENSHOTS=false, run heal mode, record the same fields.
+Optionally Run 3 — screenshots-only (strip the DOM from the prompt) if you want to isolate vision's standalone contribution — this is Dhanush's "change the whole DOM, does it still heal" stress test.
+
+Phase F — Read the results
+
+Compare the two runs on two metrics that matter:
+
+Heal rate — how many recovered.
+Correctness — of those that healed, how many found the right element. (This is the one most people skip and it's the most important.)
+
+
+Interpret honestly:
+
+Similar results in both arms → screenshots are cost without benefit for your app; drop them, save tokens.
+With-screenshots recovers cases text-only misses → vision earns its place; keep it for that class.
+Don't be surprised by "similar" — a clean parseable DOM usually lets the text path win alone. That's a valid finding, not a failure.
+
+
+
+Phase G — Record it
+
+Capture token usage / latency per run too (the API response includes usage) — that's the cost side of the cost/benefit call.
+Write the verdict into your research document's section 8.5 / recommendation #9, replacing "to investigate" with your measured conclusion.
+
+
+A couple of guardrails as you go. Re-capturing a fresh baseline before each run (steps 13, 15) is the easy thing to forget, and skipping it means the two runs aren't comparable — make it a habit. And keep every other variable fixed between Run 1 and Run 2: same elements, same break method, same temperature, only the USE_SCREENSHOTS flag changes. If you change two things at once, the result tells you nothing.
+Where do you want help next — a small SQL script to break your chosen elements consistently between runs, or a tiny results-logging tweak so each heal writes the run-type and correctness flag into healing_logs for easy comparison? Either would make Phase E and F much less manual.Opus 4.8 HighClaude is AI and can make mistakes. Please double-check responses.Aihealing · TSCopy  1 import OpenAI from 'openai';
+  2 import * as dotenv from 'dotenv';
+  3 dotenv.config();
+  4  
+  5 /**
+  6  * Azure OpenAI client.
+  7  *
+  8  * NOTE: move these secrets to environment variables before any shared/CI use.
+  9  *   apiKey  -> process.env.AZURE_OPENAI_API_KEY
+ 10  *   baseURL -> process.env.AZURE_OPENAI_ENDPOINT
+ 11  * They are left inline here only to match your current setup.
+ 12  *
+ 13  * The deployment MUST be a vision-capable model (e.g. gpt-4o / gpt-4.1) for
+ 14  * image content blocks to be understood. A text-only deployment will ignore them.
+ 15  */
+ 16 const client = new OpenAI({
+ 17   apiKey: process.env.AZURE_OPENAI_API_KEY || 'YOUR_KEY_HERE',
+ 18   baseURL: process.env.AZURE_OPENAI_ENDPOINT || 'https://testingsl1.openai.azure.com/openai/deployments/gpt-4.1',
+ 19   defaultQuery: { 'api-version': '2024-02-15-preview' },
+ 20   defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_API_KEY || 'YOUR_KEY_HERE' },
+ 21 });
+ 22  
+ 23 // ---------------------------------------------------------------------------
+ 24 // SINGLE TOGGLE for the with/without-screenshots experiment.
+ 25 // Set USE_SCREENSHOTS=false in the environment to run the text-only arm.
+ 26 
