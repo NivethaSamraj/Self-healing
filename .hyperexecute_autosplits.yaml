@@ -1,0 +1,36 @@
+---
+version: "0.1"
+globalTimeout: 90
+testSuiteTimeout: 90
+testSuiteStep: 90
+runson: win
+autosplit: true
+retryOnFailure: true
+maxRetries: 2
+concurrency: 5
+pre:
+  - npm install
+  - npx playwright install
+cacheKey: '{{ checksum "package-lock.json" }}'
+cacheDirectories:
+  - node_modules
+
+testDiscovery:
+  type: raw
+  mode: dynamic
+  command: awk '/Test ID:/ {print $NF}' tests/pc_test_scripts/'${TEST_SUITE}'.spec.js
+
+testRunnerCommand: npx playwright test pc_test_scripts/'${TEST_SUITE}'.spec.js --config=./hypertest.config.js -g $test
+
+tunnel: true
+
+#shell: bash
+
+report: true
+
+partialReports:
+  type: html
+  location: allure-results
+  frameworkName: allure-native
+
+jobLabel: [Guidewire, Playwright_JS_PC, '${TEST_SUITE}'] 
