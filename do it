@@ -1,185 +1,129 @@
+Step 1 — selfHealing.ts: store matchIndex in meta
+In extractElementMeta, inside the locator.evaluate((el) => { ... }), add this helper next to getSiblingInfo:
+typescript    function getMatchIndex(
+      element: Element
+    ): number {
 
-### MODE = heal ###
+      const tag =
+        element.tagName.toLowerCase();
 
-=== STEP 1: Open store ===
+      const text =
+        element.textContent?.trim() || '';
 
-=== STEP 2: Shop Now ===
- Shop Now (green)
- WARNING  Locator matched 0 elements
-  DB primary failed: #does-not-exist
- WARNING  Locator matched 0 elements
-  smart [role] failed: getByRole('button', { name: 'Completely Wrong' })
- WARNING  Locator matched 0 elements
-  smart [label] failed: getByLabel('Completely Wrong')
- WARNING  Locator matched 0 elements
-  smart [placeholder] failed: getByPlaceholder('Completely Wrong')
- WARNING  Locator matched 0 elements
-  smart [text] failed: getByText('Completely Wrong')
- WARNING  Locator matched 0 elements
-  smart [title] failed: getByTitle('Completely Wrong')
- WARNING  Locator matched 0 elements
-  smart [css] failed: #does-not-exist
- WARNING  Locator matched 0 elements
-  smart [xpath] failed: //*[@id='does-not-exist']
+      const all = Array.from(
+        document.querySelectorAll(tag)
+      ).filter(
+        e =>
+          (e.textContent?.trim() || '') === text
+      );
 
-=================================
-AI HEALING INVOKED : shop_now_button
-=================================
-[Test        ] novacart-checkout
-[Element     ] shop_now_button
-[Page        ] file:///C:/Users/nivetha.samraj/Documents/Knitwell_FinalVersion/endtoend.html
-[AI SELF-HEALING STARTED] Azure_OpenAI
+      return all.indexOf(element);
+    }
+Then in the returned object, change the last field from:
+typescript      outerHTML:
+        el.outerHTML
+    };
+to:
+typescript      outerHTML:
+        el.outerHTML,
 
+      matchIndex:
+        getMatchIndex(el)
+    };
+That's the only change here. Don't touch anything else in this file.
+Step 2 — fallBackEngine.ts: apply .nth() only in the AI block
+In the AI healing block (Step 3), find:
+typescript    const aiLocator = buildLocator(
+      page,
+      aiResponse.locator
+    );
 
-──────────────────────────────────────────────────
- STEP 1 — DATABASE PRIMARY LOCATOR
-──────────────────────────────────────────────────
-[Trying      ] #does-not-exist
- WARNING  Locator matched 0 elements
- FAILED   DB Primary locator failed
+    if (!aiLocator) {
 
+      throw new Error(
+        'Failed to build locator from AI response'
+      );
+    }
 
-──────────────────────────────────────────────────
- STEP 2 — SMART LOCATOR FALLBACK
-──────────────────────────────────────────────────
-[Strategy    ] role
-[Locator     ] getByRole('button', { name: 'Completely Wrong' })
- WARNING  Locator matched 0 elements
-[Result      ] FAILED
-[Strategy    ] label
-[Locator     ] getByLabel('Completely Wrong')
- WARNING  Locator matched 0 elements
-[Result      ] FAILED
-[Strategy    ] placeholder
-[Locator     ] getByPlaceholder('Completely Wrong')
- WARNING  Locator matched 0 elements
-[Result      ] FAILED
-[Strategy    ] text
-[Locator     ] getByText('Completely Wrong')
- WARNING  Locator matched 0 elements
-[Result      ] FAILED
-[Strategy    ] title
-[Locator     ] getByTitle('Completely Wrong')
- WARNING  Locator matched 0 elements
-[Result      ] FAILED
-[Strategy    ] css
-[Locator     ] #does-not-exist
- WARNING  Locator matched 0 elements
-[Result      ] FAILED
-[Strategy    ] xpath
-[Locator     ] //*[@id='does-not-exist']
- WARNING  Locator matched 0 elements
-[Result      ] FAILED
+    // =========================================================
+    // VALIDATE AI LOCATOR
+    // =========================================================
 
+    const isValid =
+      await isValidLocator(aiLocator);
 
-──────────────────────────────────────────────────
- STEP 3 — AI HEALING
-──────────────────────────────────────────────────
- AI       Collecting screenshots and DOM context
- AI       Sending healing request to AI model
- AI       Locator      : getByRole('button', { name: 'Shop Now →' })
- AI       Confidence   : 1
- AI       Reason       : The target element is a button with the exact visible text 'Shop Now →'. In the CURRENT DOM, there is exactly one <button> element with this text, and it is the prominent call-to-action at the top of the page. No other button shares this label, making getByRole('button', { name: 'Shop Now →' }) unique and robust. This matches the visual and structural identity from the old DOM and screenshot, and is the most stable, accessible locator.
+    if (isValid) {
+Replace with:
+typescript    let aiLocator = buildLocator(
+      page,
+      aiResponse.locator
+    );
 
+    if (!aiLocator) {
 
-──────────────────────────────────────────────────
- HEALING SUCCESS
-──────────────────────────────────────────────────
- SUCCESS  AI locator validated successfully
-[Final Locator] getByRole('button', { name: 'Shop Now →' })
-[Confidence  ] 1
+      throw new Error(
+        'Failed to build locator from AI response'
+      );
+    }
 
+    let resolvedStrategy = 'AI';
 
-════════════════════════════════════════════════════════════
- HEALING COMPLETED
-════════════════════════════════════════════════════════════
-  resolved via [AI]
+    const aiCount = await aiLocator.count();
 
-=== STEP 3: Scroll ===
+    if (aiCount > 1) {
 
-=== STEP 4: Open a product ===
- Open product detail
- WARNING  Locator matched 12 elements
-  DB primary failed: .product-link
+      const capturedIndex =
+        typeof element?.meta === 'string'
+          ? JSON.parse(element.meta)?.matchIndex
+          : element?.meta?.matchIndex;
 
-=================================
-AI HEALING INVOKED : product_open_link
-=================================
-[Test        ] novacart-checkout
-[Element     ] product_open_link
-[Page        ] file:///C:/Users/nivetha.samraj/Documents/Knitwell_FinalVersion/endtoend.html
-[AI SELF-HEALING STARTED] Azure_OpenAI
+      if (
+        typeof capturedIndex === 'number' &&
+        capturedIndex >= 0 &&
+        capturedIndex < aiCount
+      ) {
 
+        HealingLogger.info(
+          'Disambiguation',
+          `AI matched ${aiCount} identical elements; using index ${capturedIndex}`
+        );
 
-──────────────────────────────────────────────────
- STEP 1 — DATABASE PRIMARY LOCATOR
-──────────────────────────────────────────────────
-[Trying      ] .product-link
- WARNING  Locator matched 12 elements
- FAILED   DB Primary locator failed
+        aiLocator = aiLocator.nth(capturedIndex);
+        resolvedStrategy = 'AI+nth';
 
+      } else {
 
-──────────────────────────────────────────────────
- STEP 2 — SMART LOCATOR FALLBACK
-──────────────────────────────────────────────────
+        HealingLogger.warn(
+          `AI matched ${aiCount} elements, no usable index (${capturedIndex})`
+        );
+      }
+    }
 
+    // =========================================================
+    // VALIDATE AI LOCATOR
+    // =========================================================
 
-──────────────────────────────────────────────────
- STEP 3 — AI HEALING
-──────────────────────────────────────────────────
- AI       Collecting screenshots and DOM context
- AI       Sending healing request to AI model
- AI       Locator      : getByText('View Product →', { exact: true })
- AI       Confidence   : 1
- AI       Reason       : The element is a <span> with the exact text 'View Product →'. In the CURRENT DOM, this text appears multiple times, but each instance is a visually distinct product card 'View Product →' button. Since the instruction is to match exactly one element, and there is no unique label, role, or other distinguishing attribute, the best possible locator is getByText('View Product →', { exact: true }). This matches each button individually when used in the context of a specific product card. If further disambiguation is needed (e.g., for a specific product), a more specific selector would be required, but for the generic 'product_open_link', this is the most precise and reliable locator available in the CURRENT DOM.
- WARNING  Locator matched 12 elements
+    const isValid =
+      await isValidLocator(aiLocator);
 
-
-──────────────────────────────────────────────────
- HEALING FAILED
-──────────────────────────────────────────────────
- FAILED   AI locator is not valid on current page
-  1) [chrome] › tests\endtoend.spec.ts:201:7 › NovaCart mock store — checkout journey › Shop, add two products, apply promo, checkout 
-
-    Error: All locator strategies including AI failed for product_open_link
-
-       at core\healing\fallBackEngine.ts:418
-
-      416 |     });
-      417 |
-    > 418 |     throw new Error(
-          |           ^
-      419 |       `All locator strategies including AI failed for ${elementName}`
-      420 |     );
-      421 |   }
-        at findWithFallback (C:\Users\nivetha.samraj\Documents\Knitwell_FinalVersion\core\healing\fallBackEngine.ts:418:11)
-        at smartAct (C:\Users\nivetha.samraj\Documents\Knitwell_FinalVersion\tests\endtoend.spec.ts:154:69)
-        at step (C:\Users\nivetha.samraj\Documents\Knitwell_FinalVersion\tests\endtoend.spec.ts:192:5)
-        at C:\Users\nivetha.samraj\Documents\Knitwell_FinalVersion\tests\endtoend.spec.ts:223:5
-
-    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
-    test-results\tests-endtoend-NovaCart-mo-50229-oducts-apply-promo-checkout-chrome\test-failed-1.png
-    ────────────────────────────────────────────────────────────────────────────────────────────────
-
-    attachment #2: video (video/webm) ──────────────────────────────────────────────────────────────
-    test-results\tests-endtoend-NovaCart-mo-50229-oducts-apply-promo-checkout-chrome\video.webm
-    ────────────────────────────────────────────────────────────────────────────────────────────────
-
-    Error Context: test-results\tests-endtoend-NovaCart-mo-50229-oducts-apply-promo-checkout-chrome\error-context.md
-
-    attachment #4: trace (application/zip) ─────────────────────────────────────────────────────────
-    test-results\tests-endtoend-NovaCart-mo-50229-oducts-apply-promo-checkout-chrome\trace.zip
-    Usage:
-
-        npx playwright show-trace test-results\tests-endtoend-NovaCart-mo-50229-oducts-apply-promo-checkout-chrome\trace.zip
-
-    ────────────────────────────────────────────────────────────────────────────────────────────────
-
-  1 failed
-    [chrome] › tests\endtoend.spec.ts:201:7 › NovaCart mock store — checkout journey › Shop, add two products, apply promo, checkout 
-
-To open last HTML report run:
-
-  npx playwright show-report
-
-PS C:\Users\nivetha.samraj\Documents\Knitwell_FinalVersion> 
+    if (isValid) {
+Step 3 — fallBackEngine.ts: update the two strategy labels in the success path
+In the success branch right below, change:
+typescript        strategy: 'AI',
+        status: 'AI_HEALED',
+→
+typescript        strategy: resolvedStrategy,
+        status: 'AI_HEALED',
+and:
+typescript      return {
+        locator: aiLocator,
+        usedStrategy: 'AI',
+      };
+→
+typescript      return {
+        locator: aiLocator,
+        usedStrategy: resolvedStrategy,
+      };
+Done
+Three changes total: one in selfHealing.ts, two spots in fallBackEngine.ts. Nothing in storage, smart locators, or CSS/XPath touched. After this, re-run CAPTURE once (so matchIndex gets written to meta), then run HEAL — the 12-element product_open_link will resolve via .nth().
+One catch: you must re-capture first, otherwise old rows have no matchIndex and the fallback will skip the index and still fail on the 12.Opus 4.8 HighClaude is AI and can make mistakes. Please double-check responses.Share
