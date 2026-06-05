@@ -1,23 +1,85 @@
-import { pool } from './core/db/db';
+4) 
+assignement of return values:
 
-(async () => {
-  const { rows } = await pool.query(
-    `SELECT element_name, meta FROM elements WHERE element_name = $1`,
-    ['product_open_link']
-  );
+if (!locators.css) {
+  locators.css = await generateScopedCss(page, meta);
+}
+...
+if (!locators.xpath) {
+  locators.xpath = await generateAncestorXpath(page, meta);
+}
 
-  if (!rows.length) {
-    console.log('No row found — run CAPTURE first.');
-  } else {
-    const meta =
-      typeof rows[0].meta === 'string'
-        ? JSON.parse(rows[0].meta)
-        : rows[0].meta;
 
-    console.log('element:', rows[0].element_name);
-    console.log('matchIndex:', meta?.matchIndex);
-    console.log('tag:', meta?.tag, '| text:', meta?.text);
-  }
+5) 
+ removed duplicate - locators.css = locators.css = await generateStableCss(page,meta);
 
-  await pool.end();
-})();
+6) Added this prompt in aiHealing.ts
+
+ATTACHED IMAGES (see message, in order)
+========================
+  1. OLD ELEMENT SCREENSHOT       — the element as it originally looked
+  2. OLD FULL PAGE SCREENSHOT     — original page layout / position
+  3. CURRENT FULL PAGE SCREENSHOT — the page as it is NOW (locate within THIS)
+Some images may be omitted if not captured; fall back to the DOM in that case.
+
+========================
+REASONING STEPS (do silently, then output JSON)
+========================
+Step 1: Identify the target in the OLD element + OLD page screenshot/DOM.
+Step 2: Find the visually + structurally equivalent element in the
+        CURRENT page screenshot and CURRENT DOM.
+Step 3: Note what changed (id, class, text, structure, position).
+Step 4: Choose the highest-priority locator that LITERALLY EXISTS in the CURRENT DOM.
+Step 5: VERIFY before answering:
+        (a) Does every attribute value / text in your locator appear verbatim
+            in the CURRENT DOM above? If not, pick a different one.
+        (b) Is the value dynamic? (random ids, UUIDs, hashes, long mixed
+            alphanumerics, framework-generated classes like mui-*, ng-*,
+            css-*, hash suffixes, or ids/classes ending in 3+ digits.)
+            If yes, REJECT it and pick a human-readable alternative.
+        (c) How many elements in the CURRENT DOM does it match?
+
+========================
+LOCATOR PRIORITY (highest first)
+========================
+    1. getByRole(role, { name })
+    2. getByLabel()
+    3. getByPlaceholder()
+    4. getByText() (exact match)
+    5. CSS  (only on stable, human-readable attributes)
+    6. XPath (last resort; NEVER use positional indices like [1], [2],
+       position(), or last())
+
+========================
+STRICT RULES
+========================
+- The locator MUST exist in the CURRENT DOM. The OLD DOM and screenshots are
+  REFERENCE ONLY — never source a locator from them.
+- Use ONLY attribute values / text that literally appear in the CURRENT DOM.
+- Use exact matching wherever possible.
+- Do NOT return any locator listed under "Previous Smart Locators" — they are
+  already known to fail.
+- If the element is one of several IDENTICAL items (e.g. repeated cards/rows),
+  return the locator for the REPEATED element AS-IS (matching all N is expected).
+  The framework disambiguates the correct instance via a stored index.
+  Do NOT invent a positional [n] selector yourself, and in that case set
+  "isUnique": false (matching many identical siblings is correct here).
+- If the original element cannot be confidently mapped to a current element,
+  return locator "NO_MATCH" with confidence 0.
+
+========================
+OUTPUT FORMAT (STRICT JSON ONLY — no markdown, no prose, no code fences)
+========================
+{
+  "locator": "the Playwright locator string, or NO_MATCH",
+  "confidence": 0-1,
+  "reason": "why this locator maps OLD->CURRENT and is stable",
+  "existsInCurrentDom": true | false,
+  "isUnique": true | false,
+  "usesDynamicAttrs": true | false
+}
+
+Self-check before you respond: if "existsInCurrentDom" would be false, you have
+chosen wrong — go back to Step 4. If "usesDynamicAttrs" would be true, pick a
+different attribute.
+
