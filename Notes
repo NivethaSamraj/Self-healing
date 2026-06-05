@@ -3,26 +3,907 @@ import * as dotenv from 'dotenv';
 dotenv.config();
 
 const client = new OpenAI({
+  // SECURITY: move these to .env (AZURE_OPENAI_API_KEY) and rotate the old key.
   apiKey: process.env.AZURE_OPENAI_API_KEY!,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: { 'api-version': '2024-02-15-preview' },
-  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_API_KEY! },
+  baseURL:
+    process.env.AZURE_OPENAI_BASE_URL ??
+    'https://testingsl1.openai.azure.com/openai/deployments/gpt-4.1',
+  defaultQuery: {
+    'api-version':
+      process.env.AZURE_OPENAI_API_VERSION ?? '2024-02-15-preview',
+  },
+  defaultHeaders: {
+    'api-key': process.env.AZURE_OPENAI_API_KEY!,
+  },
 });
 
-(async () => {
-  try {
-    const res = await client.chat.completions.create({
-      model: process.env.AZURE_OPENAI_DEPLOYMENT!,
-      messages: [{
+type AIResponse = {
+  locator: string;
+  confidence: number;
+  reason: string;
+};
+
+/**
+ * Build a single image content block for the chat message.
+ * Returns null if the screenshot is missing, so callers can filter it out
+ * instead of sending an empty / "Not available" block.
+ *
+ * @param base64  raw base64 string (NO data: prefix) or null
+ * @param detail  'high' for the image the model must search within,
+ *                'low'  for reference-only images (cheaper tokens)
+ */
+function imageBlock(
+  base64: string | null | undefined,
+  detail: 'high' | 'low' = 'low'
+) {
+  if (!base64) return null;
+
+  // selfHealing.ts captures JPEG (quality 70); declare the matching mime.
+  return {
+    type: 'image_url' as const,
+    image_url: {
+      url: `data:image/jpeg;base64,${base64}`,
+      detail,
+    },
+  };
+}
+
+export async function getAILocator(data: any): Promise<AIResponse> {
+
+  // =========================================================
+  // TEXT PROMPT — DOM + instructions ONLY.
+  // Screenshots are sent as real image blocks below, not pasted here.
+  // =========================================================
+  const prompt = `
+You are a Playwright locator expert with visual reasoning.
+
+Goal:
+Generate a UNIQUE, STABLE, and RELIABLE locator for the target element,
+using BOTH the DOM text below AND the attached screenshots.
+
+========================
+CONTEXT
+========================
+
+Element Name:
+${data.elementName}
+
+Failed Locator:
+${data.failedLocator}
+
+Previous Smart Locators:
+${JSON.stringify(data.smartLocators)}
+
+Element Metadata:
+${JSON.stringify(data.meta)}
+
+------------------------
+OLD ELEMENT SNAPSHOT (outerHTML)
+------------------------
+${data.oldOuterHTML || 'Not available'}
+
+------------------------
+OLD PAGE DOM
+------------------------
+${data.oldDOM || 'Not available'}
+
+------------------------
+CURRENT PAGE DOM (SOURCE OF TRUTH)
+------------------------
+${data.newDOM || 'Not available'}
+
+========================
+ATTACHED IMAGES (see message)
+========================
+The images attached to this message, in order, are:
+  1. OLD ELEMENT SCREENSHOT      — the element as it originally looked
+  2. OLD FULL PAGE SCREENSHOT    — original page layout / position
+  3. CURRENT FULL PAGE SCREENSHOT — the page as it is NOW (locate within this)
+Some images may be omitted if they were not captured; rely on the DOM then.
+
+========================
+INSTRUCTIONS
+========================
+
+Step 1: Identify the target in the OLD element + OLD page screenshot.
+Step 2: Find the visually + structurally equivalent element in the
+        CURRENT page screenshot and CURRENT DOM.
+Step 3: Note what changed (id, class, text, structure, position).
+Step 4: Produce the best locator that exists in the CURRENT DOM.
+
+========================
+RULES (STRICT)
+========================
+- The locator MUST exist in the CURRENT DOM (the source of truth).
+- Prefer, in order:
+    1. getByRole(role, { name })
+    2. getByLabel()
+    3. getByPlaceholder()
+    4. getByText() (exact match)
+  then CSS, and XPath only if unavoidable.
+- Avoid dynamic attributes (random ids, hashes, framework-generated classes).
+- Use exact matching wherever possible.
+- If the element is one of several identical items (e.g. repeated cards),
+  return the locator for that REPEATED element as-is; the framework will
+  disambiguate which instance using a stored index. Do NOT invent a
+  positional [n] selector yourself.
+- Only use attributes that literally appear in the CURRENT DOM.
+
+If the original element cannot be confidently mapped to a current element,
+return:
+{ "locator": "NO_MATCH", "confidence": 0, "reason": "No equivalent element found" }
+
+========================
+OUTPUT FORMAT (STRICT JSON ONLY — no markdown, no prose)
+========================
+{
+  "locator": "...",
+  "confidence": 0-1,
+  "reason": "Why this locator uniquely identifies the element (OLD vs CURRENT)"
+}
+`.trim();
+
+  // =========================================================
+  // MULTIMODAL USER CONTENT
+  // Order matters: the text references images 1/2/3 in this order.
+  // Missing images are filtered out so no empty blocks are sent.
+  // =========================================================
+  const userContent: any[] = [
+    { type: 'text', text: prompt },
+  ];
+
+  const images = [
+    // reference-only images -> low detail (cheaper)
+    imageBlock(data.oldElementScreenshot, 'low'),
+    imageBlock(data.oldPageScreenshot, 'low'),
+    // the page the model must locate within -> high detail
+    imageBlock(data.currentPageScreenshot, 'high'),
+  ].filter(Boolean);
+
+  userContent.push(...images);
+
+  const response = await client.chat.completions.create({
+    model: process.env.AZURE_OPENAI_DEPLOYMENT!,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You generate Playwright locators using DOM text and attached screenshots. Respond with strict JSON only.',
+      },
+      {
         role: 'user',
-        content: [
-          { type: 'text', text: 'What color is the shape in this image? One word.' },
-          { type: 'image_url', image_url: { url: 'https://via.placeholder.com/150/FF0000' } },
-        ],
-      }],
-    });
-    console.log('answer:', res.choices[0].message.content);
-  } catch (e: any) {
-    console.error('ERROR:', e.status, e.message);
+        content: userContent,
+      },
+    ],
+    temperature: 0.2,
+  });
+
+  const text = response.choices[0].message.content || '';
+
+  const cleaned = text
+    .replace(/```json/g, '')
+    .replace(/```/g, '')
+    .trim();
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    throw new Error('Invalid AI response');
   }
-})();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import { Page, Locator } from '@playwright/test';
+import { getElement } from '../db/elementRepo';
+import { getAILocator } from '../ai/aiHealing';
+import { saveHealingLog } from '../db/healingRepo';
+import { getMinimalFullDOM } from '../../utils/selfHealing';
+import { HealingLogger } from '../../utils/healingLogger';
+import { containsDynamicId } from '../../utils/selfHealing';
+
+//  TYPE FIRST
+type FallbackResult = {
+  locator: Locator;
+  usedStrategy: string;
+};
+
+export async function findWithFallback(
+  page: Page,
+  elementName: string,
+  primaryLocator: Locator,
+  testName: string = 'default-test'
+): Promise<FallbackResult> {
+
+  const attempted: string[] = [];
+
+  // =========================================================
+  // START LOGGING
+  // =========================================================
+
+  HealingLogger.info('Test', testName);
+  HealingLogger.info('Element', elementName);
+  HealingLogger.info('Page', page.url());
+
+  HealingLogger.info('AI SELF-HEALING STARTED', 'Azure_OpenAI');
+
+  // =========================================================
+  // STEP 1 — FETCH ELEMENT FROM DB
+  // =========================================================
+
+  HealingLogger.subSection(
+    'STEP 1 — DATABASE PRIMARY LOCATOR'
+  );
+
+  const element = await getElement(elementName);
+
+  if (!element) {
+
+    HealingLogger.fail(
+      `No locator data found for ${elementName}`
+    );
+
+    throw new Error(
+      `No locator data found for ${elementName}`
+    );
+  }
+
+  const dbPrimaryLocatorStr = element.primary_locator;
+
+  if (dbPrimaryLocatorStr) {
+
+    HealingLogger.info(
+      'Trying',
+      dbPrimaryLocatorStr
+    );
+
+    const dbPrimary = buildLocator(
+      page,
+      dbPrimaryLocatorStr
+    );
+
+    if (
+      dbPrimary &&
+      await isValidLocator(dbPrimary)
+    ) {
+
+      HealingLogger.success(
+        `DB Primary locator worked`
+      );
+
+      await saveHealingLog({
+        elementName,
+        testName,
+        failedLocator: 'POM_PRIMARY',
+        attemptedLocators: attempted,
+        healedLocator: dbPrimaryLocatorStr,
+        strategy: 'db-primary',
+        status: 'HEALED',
+        errorMessage: null,
+      });
+
+      return {
+        locator: dbPrimary,
+        usedStrategy: 'db-primary',
+      };
+    }
+
+    attempted.push('db-primary');
+
+    HealingLogger.fail(
+      `DB Primary locator failed`
+    );
+  }
+
+  // =========================================================
+  // STEP 2 — SMART LOCATOR FALLBACK
+  // =========================================================
+
+  HealingLogger.subSection(
+    'STEP 2 — SMART LOCATOR FALLBACK'
+  );
+
+  const smartLocators =
+    typeof element.smart_locators === 'string'
+      ? JSON.parse(element.smart_locators)
+      : element.smart_locators;
+
+  const priority = [
+    'role',
+    'testId',
+    'label',
+    'placeholder',
+    'text',
+    'alt',
+    'title',
+    'css',
+    'xpath'
+  ];
+
+  for (const key of priority) {
+
+    const locatorStr = smartLocators?.[key];
+
+    if (!locatorStr) continue;
+
+    attempted.push(key);
+
+    HealingLogger.info(
+      'Strategy',
+      key
+    );
+
+    HealingLogger.info(
+      'Locator',
+      locatorStr
+    );
+
+    const built = buildLocator(
+      page,
+      locatorStr
+    );
+
+    if (!built) {
+
+      HealingLogger.fail(
+        'Failed to build locator'
+      );
+
+      continue;
+    }
+
+    const valid = await isValidLocator(built);
+
+    HealingLogger.info(
+      'Result',
+      valid ? 'SUCCESS' : 'FAILED'
+    );
+
+    if (valid) {
+
+      HealingLogger.success(
+        `Element healed using ${key}`
+      );
+
+      await saveHealingLog({
+        elementName,
+        testName,
+        failedLocator: primaryLocator,
+        attemptedLocators: attempted,
+        healedLocator: locatorStr,
+        strategy: key,
+        status: 'HEALED',
+        errorMessage: null,
+      });
+
+      HealingLogger.section(
+        'HEALING COMPLETED'
+      );
+
+      return {
+        locator: built,
+        usedStrategy: key,
+      };
+    }
+  }
+
+  // =========================================================
+  // STEP 3 — AI HEALING
+  // =========================================================
+
+  HealingLogger.subSection(
+    'STEP 3 — AI HEALING'
+  );
+
+  HealingLogger.ai(
+    'Collecting screenshots and DOM context'
+  );
+
+  try {
+
+    // =========================================================
+    // CURRENT SCREENSHOT
+    // =========================================================
+
+    // Capture as JPEG (quality 70) to match the old screenshots' format
+    // and the image mime type declared in aiHealing.ts, and to keep the
+    // payload small.
+    const screenshotBuffer =
+      await page.screenshot({
+        fullPage: true,
+        type: 'jpeg',
+        quality: 70,
+      });
+
+    const currentPageScreenshot =
+      screenshotBuffer.toString('base64');
+
+    // =========================================================
+    // OLD ELEMENT SCREENSHOT
+    // =========================================================
+
+    const oldElementScreenshot =
+      element?.element_screenshot
+        ? Buffer
+          .from(element.element_screenshot)
+          .toString('base64')
+        : null;
+
+    // =========================================================
+    // OLD FULL PAGE SCREENSHOT
+    // =========================================================
+
+    const oldPageScreenshot =
+      element?.full_page_screenshot
+        ? Buffer
+          .from(element.full_page_screenshot)
+          .toString('base64')
+        : null;
+
+    // =========================================================
+    // OLD OUTER HTML
+    // =========================================================
+
+    const oldOuterHTML =
+      element?.outer_html || '';
+
+    if (!oldOuterHTML) {
+
+      HealingLogger.warn(
+        'No stored outerHTML found'
+      );
+    }
+
+    HealingLogger.ai(
+      'Sending healing request to AI model'
+    );
+
+    // =========================================================
+    // AI CALL
+    // =========================================================
+
+    const aiResponse = await getAILocator({
+      elementName,
+      failedLocator: primaryLocator.toString(),
+      smartLocators,
+      oldOuterHTML: element.outer_html,
+      oldDOM: element.context_dom,
+      newDOM: await getMinimalFullDOM(page),
+      currentPageScreenshot,
+      oldPageScreenshot,
+      oldElementScreenshot,
+      meta: element?.meta || {},
+    });
+
+    // =========================================================
+    // AI RESPONSE LOGGING
+    // =========================================================
+
+    HealingLogger.ai(
+      `Locator      : ${aiResponse?.locator}`
+    );
+
+    HealingLogger.ai(
+      `Confidence   : ${aiResponse?.confidence}`
+    );
+
+    HealingLogger.ai(
+      `Reason       : ${aiResponse?.reason}`
+    );
+
+    // =========================================================
+    // VALIDATE AI RESPONSE
+    // =========================================================
+
+    if (
+      !aiResponse ||
+      !aiResponse.locator
+    ) {
+
+      throw new Error(
+        'AI returned empty or invalid response'
+      );
+    }
+
+    // =========================================================
+    // CONFIDENCE CHECK
+    // =========================================================
+
+    if (aiResponse.confidence < 0.7) {
+
+      throw new Error(
+        `Low confidence AI response: ${aiResponse.confidence}`
+      );
+    }
+
+    // =========================================================
+    // BUILD AI LOCATOR
+    // =========================================================
+
+    if (
+      containsDynamicId(
+        aiResponse.locator
+      )
+    ) {
+
+      throw new Error(
+        'AI returned dynamic locator'
+      );
+    }
+
+    let aiLocator = buildLocator(
+      page,
+      aiResponse.locator
+    );
+
+    if (!aiLocator) {
+
+      throw new Error(
+        'Failed to build locator from AI response'
+      );
+    }
+
+    // =========================================================
+    // RESOLVE 1-of-N IDENTICAL ELEMENTS (AI FALLBACK ONLY)
+    // If the AI locator is correct but matches multiple identical
+    // siblings, disambiguate using the captured matchIndex from meta.
+    // This index logic exists ONLY here, never in DB/smart-locator phases.
+    // =========================================================
+
+    let resolvedStrategy = 'AI';
+
+    const aiCount = await aiLocator.count();
+
+    if (aiCount > 1) {
+
+      const elementMeta =
+        typeof element?.meta === 'string'
+          ? JSON.parse(element.meta)
+          : element?.meta;
+
+      const capturedIndex = elementMeta?.matchIndex;
+
+      if (
+        typeof capturedIndex === 'number' &&
+        capturedIndex >= 0 &&
+        capturedIndex < aiCount
+      ) {
+
+        HealingLogger.info(
+          'Disambiguation',
+          `AI matched ${aiCount} identical elements; using captured index ${capturedIndex}`
+        );
+
+        aiLocator = aiLocator.nth(capturedIndex);
+        resolvedStrategy = 'AI+nth';
+
+      } else {
+
+        HealingLogger.warn(
+          `AI matched ${aiCount} elements, no usable captured index (got ${capturedIndex})`
+        );
+      }
+    }
+
+    // =========================================================
+    // VALIDATE AI LOCATOR
+    // =========================================================
+
+    const isValid =
+      await isValidLocator(aiLocator);
+
+    if (isValid) {
+
+      HealingLogger.subSection(
+        'HEALING SUCCESS'
+      );
+
+      HealingLogger.success(
+        'AI locator validated successfully'
+      );
+
+      HealingLogger.info(
+        'Final Locator',
+        aiResponse.locator
+      );
+
+      HealingLogger.info(
+        'Confidence',
+        aiResponse.confidence
+      );
+
+      await saveHealingLog({
+        elementName,
+        testName,
+        failedLocator: primaryLocator.toString(),
+        attemptedLocators: attempted,
+        healedLocator: aiResponse.locator,
+        strategy: resolvedStrategy,
+        status: 'AI_HEALED',
+        errorMessage: null,
+      });
+
+      HealingLogger.section(
+        'HEALING COMPLETED'
+      );
+
+      return {
+        locator: aiLocator,
+        usedStrategy: resolvedStrategy,
+      };
+    }
+
+    throw new Error(
+      'AI locator is not valid on current page'
+    );
+
+  } catch (error: any) {
+
+    HealingLogger.subSection(
+      'HEALING FAILED'
+    );
+
+    HealingLogger.fail(
+      error?.message || 'Unknown healing error'
+    );
+
+    await saveHealingLog({
+      elementName,
+      testName,
+      failedLocator: primaryLocator.toString(),
+      attemptedLocators: attempted,
+      healedLocator: null,
+      strategy: 'AI',
+      status: 'FAILED',
+      errorMessage: error?.message || 'Unknown error',
+    });
+
+    throw new Error(
+      `All locator strategies including AI failed for ${elementName}`
+    );
+  }
+}
+
+export function buildLocator(page: Page, locatorStr: string): Locator | null {
+  try {
+    // getByRole
+
+    if (locatorStr.startsWith('getByRole')) {
+
+
+     const roleMatch = locatorStr.match(
+  /getByRole\(\s*['"](.*?)['"]\s*,\s*\{[\s\S]*?name\s*:\s*['"](.*?)['"]/
+);
+
+      if (roleMatch) {
+
+        const role = roleMatch[1]?.trim();
+
+        const name = roleMatch[2]?.trim();
+
+        return page.getByRole(
+          role as any,
+          {
+            name,
+            exact: true,
+          }
+        );
+      }
+
+      console.warn(
+        `Failed to parse getByRole locator: ${locatorStr}`
+      );
+    }
+
+    if (
+      locatorStr.startsWith(
+        'getByTestId'
+      )
+    ) {
+
+      const val =
+        locatorStr.match(
+          /getByTestId\(\s*['"](.*?)['"]/
+        )?.[1];
+
+      if (val) {
+
+        return page.getByTestId(
+          val
+        );
+      }
+    }
+
+    // getByText
+    if (locatorStr.startsWith('getByText')) {
+      const text = locatorStr.match(/getByText\(\s*['"](.*?)['"]/)?.[1];
+      if (text) return page.getByText(text, { exact: true });
+    }
+
+    // getByPlaceholder
+    if (locatorStr.startsWith('getByPlaceholder')) {
+      const val = locatorStr.match(/getByPlaceholder\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByPlaceholder(new RegExp(`^${escapeRegex(val)}$`));
+      }
+    }
+
+    // getByLabel
+    if (locatorStr.startsWith('getByLabel')) {
+      const val = locatorStr.match(/getByLabel\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByLabel(val, { exact: true });
+      }
+    }
+
+    // getByAltText
+    if (locatorStr.startsWith('getByAltText')) {
+      const val = locatorStr.match(/getByAltText\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByAltText(val, { exact: true });
+      }
+    }
+
+    // getByTitle
+    if (locatorStr.startsWith('getByTitle')) {
+      const val = locatorStr.match(/getByTitle\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByTitle(val, { exact: true });
+      }
+    }
+
+    // CSS / XPath fallback
+    return page.locator(locatorStr);
+
+  } catch {
+    return null;
+  }
+}
+
+// Validate locator safely
+export async function isValidLocator(
+  locator: Locator
+): Promise<boolean> {
+  try {
+
+    const count = await locator.count();
+
+    if (count === 0) {
+      HealingLogger.warn(
+        'Locator matched 0 elements'
+      );
+      return false;
+    }
+
+    if (count > 1) {
+      HealingLogger.warn(
+        `Locator matched ${count} elements`
+      );
+      return false;
+    }
+
+    await locator.waitFor({
+      state: 'visible',
+      timeout: 3000,
+    });
+
+    return true;
+
+  } catch (error: any) {
+
+    HealingLogger.warn(
+      `Locator validation failed: ${error.message}`
+    );
+
+    return false;
+  }
+}
+function escapeRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
