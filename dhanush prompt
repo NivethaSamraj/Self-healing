@@ -402,3 +402,50 @@ export async function getAILocator(data: any, page: Page): Promise<AIResponse> {
     reason: `None of ${candidates.length} candidates resolved to a unique element on the current page`,
   };
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const aiResponse = await getAILocator(
+  {
+    elementName,
+    failedLocator: primaryLocator.toString(),
+    smartLocators,
+    oldOuterHTML: element.outer_html,
+    oldDOM: element.full_dom,
+    newDOM: await getMinimalFullDOM(page),
+    currentPageScreenshot,
+    oldPageScreenshot,
+    oldElementScreenshot,
+    meta: element?.meta || {},
+  },
+  page,
+);
