@@ -1,129 +1,23 @@
-Step 1 — selfHealing.ts: store matchIndex in meta
-In extractElementMeta, inside the locator.evaluate((el) => { ... }), add this helper next to getSiblingInfo:
-typescript    function getMatchIndex(
-      element: Element
-    ): number {
+import { pool } from './core/db/db';
 
-      const tag =
-        element.tagName.toLowerCase();
+(async () => {
+  const { rows } = await pool.query(
+    `SELECT element_name, meta FROM elements WHERE element_name = $1`,
+    ['product_open_link']
+  );
 
-      const text =
-        element.textContent?.trim() || '';
+  if (!rows.length) {
+    console.log('No row found — run CAPTURE first.');
+  } else {
+    const meta =
+      typeof rows[0].meta === 'string'
+        ? JSON.parse(rows[0].meta)
+        : rows[0].meta;
 
-      const all = Array.from(
-        document.querySelectorAll(tag)
-      ).filter(
-        e =>
-          (e.textContent?.trim() || '') === text
-      );
+    console.log('element:', rows[0].element_name);
+    console.log('matchIndex:', meta?.matchIndex);
+    console.log('tag:', meta?.tag, '| text:', meta?.text);
+  }
 
-      return all.indexOf(element);
-    }
-Then in the returned object, change the last field from:
-typescript      outerHTML:
-        el.outerHTML
-    };
-to:
-typescript      outerHTML:
-        el.outerHTML,
-
-      matchIndex:
-        getMatchIndex(el)
-    };
-That's the only change here. Don't touch anything else in this file.
-Step 2 — fallBackEngine.ts: apply .nth() only in the AI block
-In the AI healing block (Step 3), find:
-typescript    const aiLocator = buildLocator(
-      page,
-      aiResponse.locator
-    );
-
-    if (!aiLocator) {
-
-      throw new Error(
-        'Failed to build locator from AI response'
-      );
-    }
-
-    // =========================================================
-    // VALIDATE AI LOCATOR
-    // =========================================================
-
-    const isValid =
-      await isValidLocator(aiLocator);
-
-    if (isValid) {
-Replace with:
-typescript    let aiLocator = buildLocator(
-      page,
-      aiResponse.locator
-    );
-
-    if (!aiLocator) {
-
-      throw new Error(
-        'Failed to build locator from AI response'
-      );
-    }
-
-    let resolvedStrategy = 'AI';
-
-    const aiCount = await aiLocator.count();
-
-    if (aiCount > 1) {
-
-      const capturedIndex =
-        typeof element?.meta === 'string'
-          ? JSON.parse(element.meta)?.matchIndex
-          : element?.meta?.matchIndex;
-
-      if (
-        typeof capturedIndex === 'number' &&
-        capturedIndex >= 0 &&
-        capturedIndex < aiCount
-      ) {
-
-        HealingLogger.info(
-          'Disambiguation',
-          `AI matched ${aiCount} identical elements; using index ${capturedIndex}`
-        );
-
-        aiLocator = aiLocator.nth(capturedIndex);
-        resolvedStrategy = 'AI+nth';
-
-      } else {
-
-        HealingLogger.warn(
-          `AI matched ${aiCount} elements, no usable index (${capturedIndex})`
-        );
-      }
-    }
-
-    // =========================================================
-    // VALIDATE AI LOCATOR
-    // =========================================================
-
-    const isValid =
-      await isValidLocator(aiLocator);
-
-    if (isValid) {
-Step 3 — fallBackEngine.ts: update the two strategy labels in the success path
-In the success branch right below, change:
-typescript        strategy: 'AI',
-        status: 'AI_HEALED',
-→
-typescript        strategy: resolvedStrategy,
-        status: 'AI_HEALED',
-and:
-typescript      return {
-        locator: aiLocator,
-        usedStrategy: 'AI',
-      };
-→
-typescript      return {
-        locator: aiLocator,
-        usedStrategy: resolvedStrategy,
-      };
-Done
-Three changes total: one in selfHealing.ts, two spots in fallBackEngine.ts. Nothing in storage, smart locators, or CSS/XPath touched. After this, re-run CAPTURE once (so matchIndex gets written to meta), then run HEAL — the 12-element product_open_link will resolve via .nth().
-One catch: you must re-capture first, otherwise old rows have no matchIndex and the fallback will skip the index and still fail on the 12.Opus 4.8 HighClaude is AI and can make mistakes. Please double-check responses.Share
+  await pool.end();
+})();
