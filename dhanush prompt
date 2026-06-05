@@ -1,30 +1,109 @@
-export function buildLocatorPrompt(
-context: any
-): string {
- 
-return `
+import OpenAI from 'openai';
+import * as dotenv from 'dotenv';
+import { Page } from '@playwright/test';
+dotenv.config();
+
+/** True for XPath that encodes position rather than identity: [2], position(), last(). */
+function isPositionalXPath(xpath: string): boolean {
+  const x = xpath.replace(/^xpath=/, '');
+  return /\[\d+\]/.test(x) || /position\s*\(/i.test(x) || /last\s*\(/i.test(x);
+}
+
+/**
+ * Secrets must come from the environment. The previously inlined key has been
+ * shared in plaintext and should be rotated in the Azure portal immediately.
+ */
+const client = new OpenAI({
+  apiKey: process.env.AZURE_OPENAI_API_KEY!,
+  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
+  defaultQuery: { 'api-version': '2024-02-15-preview' },
+  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_API_KEY! },
+});
+
+/**
+ * Return contract is unchanged so fallBackEngine.ts needs no edits.
+ * The manager's prompt returns a candidate ARRAY of xpaths; we pick the first
+ * one and surface it through this same shape. confidence is synthesised:
+ *   - 1   when the model returned a usable candidate
+ *   - 0   when the model returned NO_MATCH / nothing
+ */
+type AIResponse = {
+  locator: string;
+  confidence: number;
+  reason: string;
+};
+
+type LocatorCandidate = { xpath: string };
+type PromptResult = { locators: LocatorCandidate[] };
+
+/**
+ * Build the prompt context expected by the manager's template from the flat
+ * data object that fallBackEngine passes in. Anything missing degrades to ''.
+ */
+function buildPromptContext(data: any) {
+  const meta = data?.meta || {};
+  const ancestorsHtml = Array.isArray(meta.ancestors)
+    ? meta.ancestors
+        .map((a: any) =>
+          `<${a.tag}${a.id ? ` id="${a.id}"` : ''}${a.name ? ` name="${a.name}"` : ''}${a.ariaLabel ? ` aria-label="${a.ariaLabel}"` : ''}>`
+        )
+        .join('\n')
+    : '';
+
+  const siblings = Array.isArray(meta.siblings) ? meta.siblings : [];
+
+  return {
+    target: {
+      html: data.oldOuterHTML || meta.outerHTML || '',
+      attributes: {
+        tag: meta.tag,
+        id: meta.id,
+        name: meta.name,
+        testId: meta.testId,
+        ariaLabel: meta.label,
+        placeholder: meta.placeholder,
+        text: meta.text,
+        alt: meta.alt,
+        title: meta.title,
+        role: meta.role,
+        type: meta.type,
+      },
+    },
+    context: {
+      ancestorsHtml,
+      previousSibling: siblings[0] ? JSON.stringify(siblings[0]) : '',
+      nextSibling: siblings[1] ? JSON.stringify(siblings[1]) : '',
+      firstChild: '',
+    },
+    // CURRENT dom is the source of truth for the new prompt.
+    minimizedDom: data.newDOM || '',
+  };
+}
+
+export function buildLocatorPrompt(context: any): string {
+  return `
 You are an Expert Test Automation Architect.
- 
+
 GOAL
- 
+
 The locator must be:
- 
+
 ✔ Unique
 ✔ Stable
 ✔ Human-readable
 ✔ Maintainable
 ✔ Resistant to UI changes
- 
+
 =================================================
 LOCATOR GENERATION STRATEGY
 ===========================
- 
+
 Use the first valid strategy:
- 
+
 1. Stable target attributes
- 
+
 Prefer:
- 
+
 * data-testid
 * data-test
 * aria-label
@@ -34,154 +113,95 @@ Prefer:
 * title
 * alt
 * stable id
- 
+
 Examples:
- 
+
 //button[@data-testid='save']
- 
+
 //input[@name='username']
- 
+
 =================================================
 2. Visible Text
 ===============
- 
+
 Examples:
- 
+
 //button[normalize-space()='Save']
- 
+
 //span[contains(normalize-space(.),'Customer')]
- 
+
 =================================================
 3. Ancestor Scoped Locator
 ==========================
- 
+
 If the target itself is not unique:
- 
+
 Use the nearest stable ancestor and scope to the target.
- 
+
 Examples:
- 
+
 //form[@data-testid='customer-form']//button[@type='submit']
- 
+
 //section[.//h2[normalize-space()='Customer Details']]//input[@name='email']
- 
+
 =================================================
 4. Parent Child Relationship
 ============================
- 
+
 Examples:
- 
+
 //div[@aria-label='Account Menu']//button
- 
+
 =================================================
 5. Sibling Relationship
 =======================
- 
+
 Examples:
- 
+
 //label[normalize-space()='Email']/parent::*//input
- 
+
 //span[normalize-space()='Address']/parent::*//input
- 
+
 =================================================
 SVG RULE
 ========
- 
+
 If the target element is:
- 
+
 - svg
 - path
 - circle
 - rect
 - polygon
 - g
- 
+
 DO NOT generate a locator for the SVG itself.
- 
+
 Instead:
- 
+
 Find the nearest clickable parent.
- 
-Examples:
- 
+
 GOOD:
 //a[@aria-label='Sign in to your Account']
- 
+
 GOOD:
 //button[@aria-label='Search']
- 
+
 BAD:
 //a[@aria-label='Sign in to your Account']//svg
- 
+
 BAD:
 //svg[@role='presentation']
- 
+
 BAD:
 //path
- 
- 
-=================================================
-POSITIONAL LOCATOR FALLBACK
-=================================================
- 
-Positional locators are NOT preferred.
- 
-Always try the following FIRST:
- 
-1. Stable target attributes
-2. Visible text
-3. Ancestor scoped locator
-4. Parent-child relationship
-5. Sibling relationship
-6. Descendant relationship
- 
-Only if ALL of the above fail to produce a unique locator:
- 
-You MAY generate a positional locator.
- 
-Examples:
- 
-(//button)[2]
- 
-(//img)[4]
- 
-(//svg)[3]
- 
-Rules:
- 
-✔ Positional locators must always be ranked LAST.
- 
-✔ Stable locators must always be preferred.
- 
-✔ Never choose a positional locator when a stable locator exists.
- 
-✔ Use positional locators only as a final fallback.
- 
-✔ Positional locators should be returned only to avoid returning an empty locator list.
- 
-Examples:
- 
-GOOD:
- 
-//button[@aria-label='Search']
- 
-//label[normalize-space()='Email']/following-sibling::input
- 
-//section[.//h2[normalize-space()='Customer Details']]//button
- 
-LAST RESORT:
- 
-(//button)[2]
- 
-(//img)[4]
- 
- 
+
 =================================================
 DYNAMIC VALUE DETECTION
 =================================================
- 
+
 Treat these values as unstable:
- 
+
 - UUIDs
 - hashes
 - generated ids
@@ -192,67 +212,26 @@ Treat these values as unstable:
 - srcset
 - data-src
 - data-srcset
- 
-Examples:
- 
-BAD:
-//div[@id='a6455b11dbd0bb82df4f204540']
- 
-BAD:
-//img[@data-srcset='https://...jpg']
- 
-BAD:
-//img[contains(@src,'banner.jpg')]
- 
-Never use these.
- 
-Instead locate using:
- 
-- ancestor
-- parent
-- sibling
-- descendant
-- heading
-- label
-- nearby text
- 
-For IMAGE elements:
- 
-DO NOT identify the image.
- 
-Identify the BUSINESS CONTEXT around the image.
- 
-Use:
- 
-- nearest heading
-- nearest section
-- nearest card
-- nearest category name
-- nearest product title
- 
+
+Never use these. Instead locate using ancestor, parent, sibling,
+descendant, heading, label, or nearby text.
+
+For IMAGE elements: DO NOT identify the image. Identify the BUSINESS
+CONTEXT around the image (nearest heading / section / card / category /
+product title).
+
 GOOD:
- 
 //section[.//h2[normalize-space()='Tees & Knits']]//img
- 
-GOOD:
- 
-//div[.//span[normalize-space()='Tees & Knits']]//img
- 
+
 BAD:
- 
 //img[@src='...']
- 
-BAD:
- 
-//img[@data-srcset='...']
- 
- 
+
 =================================================
 FORBIDDEN ATTRIBUTES
 ====================
- 
+
 Never use:
- 
+
 ❌ class
 ❌ style
 ❌ href
@@ -265,315 +244,161 @@ Never use:
 ❌ aria-hidden
 ❌ aria-expanded
 ❌ aria-selected
- 
+
+=================================================
+POSITIONAL LOCATOR FALLBACK
+=================================================
+
+Positional locators are NOT preferred. Always try first:
+
+1. Stable target attributes
+2. Visible text
+3. Ancestor scoped locator
+4. Parent-child relationship
+5. Sibling relationship
+6. Descendant relationship
+
+Only if ALL of the above fail to produce a unique locator MAY you
+generate a positional locator, e.g. (//button)[2], (//img)[4].
+
+Rules:
+✔ Positional locators must always be ranked LAST.
+✔ Stable locators must always be preferred.
+✔ Never choose a positional locator when a stable locator exists.
+
 =================================================
 QUALITY GATE
 =================================================
- 
+
 Before returning:
- 
+
+✔ Locator must exist in the CURRENT (minimized) DOM below.
 ✔ Locator should uniquely identify the target.
- 
 ✔ Locator should avoid dynamic values.
- 
-✔ Locator should prefer semantic relationships.
- 
-✔ Locator should prefer stable attributes.
- 
+✔ Locator should prefer semantic relationships and stable attributes.
 ✔ Locator should avoid positional locators whenever possible.
- 
-If a stable unique locator exists:
- 
-DO NOT return positional locators before it.
- 
-If no stable unique locator exists:
- 
-A positional locator may be returned as the final fallback candidate.
- 
-Order candidates using:
- 
-1. Stability
-2. Maintainability
-3. Human readability
-4. Simplicity
-5. Positional fallback (last)
- 
+
+The CURRENT minimized DOM is the source of truth. Never use an attribute
+that does not literally appear in it. If no equivalent element can be
+found, return an empty locators array.
+
 =================================================
 TARGET CONTEXT
 ==============
- 
+
 Target:
 ${context.target.html}
- 
+
 Target Attributes:
 ${JSON.stringify(context.target.attributes, null, 2)}
- 
+
 Ancestors:
 ${context.context.ancestorsHtml}
- 
+
 Previous Sibling:
 ${context.context.previousSibling}
- 
+
 Next Sibling:
 ${context.context.nextSibling}
- 
+
 First Child:
 ${context.context.firstChild}
- 
+
 Minimized DOM:
 ${context.minimizedDom}
- 
+
 =================================================
 OUTPUT FORMAT
 =============
- 
-Return ONLY JSON.
- 
-{
-"locators": [
-{
-"xpath": "//..."
-}
-]
-}
- 
- 
-=================================================
-LOCATOR PRIORITY AND FINAL SELECTION
-=================================================
- 
-Choose the MOST STABLE unique locator.
- 
-Priority Order:
- 
-1. Stable target attributes
- 
-   Preferred:
- 
-   - data-testid
-   - data-test
-   - aria-label
-   - aria-labelledby
-   - name
-   - placeholder
-   - title
-   - alt
-   - stable id
- 
-2. Visible text
- 
-3. Ancestor scoped locator
- 
-4. Parent-child relationship
- 
-5. Sibling relationship
- 
-6. Descendant relationship
- 
-7. Positional locator (LAST RESORT)
- 
--------------------------------------------------
-POSITIONAL LOCATOR RULE
--------------------------------------------------
- 
-Positional locators are allowed ONLY when:
- 
-✔ The target cannot be uniquely identified using stable attributes.
- 
-✔ The target cannot be uniquely identified using visible text.
- 
-✔ The target cannot be uniquely identified using ancestor relationships.
- 
-✔ The target cannot be uniquely identified using parent-child relationships.
- 
-✔ The target cannot be uniquely identified using sibling relationships.
- 
-✔ The target cannot be uniquely identified using descendant relationships.
- 
-If ALL strategies fail:
- 
-You MAY generate a positional locator.
- 
-Examples:
- 
-(//button)[2]
- 
-(//img)[4]
- 
-(//svg)[3]
- 
-Rules:
- 
-✔ Positional locators must always be returned as the final candidate.
- 
-✔ Never rank a positional locator above a stable locator.
- 
-✔ Never choose a positional locator if a stable locator exists.
- 
-✔ Positional locators should only prevent returning an empty locator list.
- 
-✔ Positional locators must always be the last ranked locator.
- 
--------------------------------------------------
-STABILITY RANKING
--------------------------------------------------
- 
-Always rank:
- 
-Stable locator
->
-Relationship locator
->
-Positional locator
- 
-Examples:
- 
-BEST:
- 
-//button[@aria-label='Search']
- 
-BETTER:
- 
-//section[.//h2[normalize-space()='Customer Details']]//button
- 
-LAST RESORT:
- 
-(//button)[2]
- 
-Even if the positional locator is shorter,
-the stable locator must rank higher.
- 
--------------------------------------------------
-UNSTABLE LOCATOR HANDLING
--------------------------------------------------
- 
-The following should NEVER be preferred over a stable locator:
- 
-❌ dynamic ids
- 
-❌ generated ids
- 
-❌ UUIDs
- 
-❌ hash-like values
- 
-❌ image URLs
- 
-❌ src
- 
-❌ srcset
- 
-❌ data-src
- 
-❌ data-srcset
- 
-❌ generated class names
- 
-❌ framework generated identifiers
- 
-Examples:
- 
-BAD:
- 
-//div[@id='a6455b11dbd0bb82df4f204540']
- 
-BAD:
- 
-//img[@data-srcset='https://example.com/banner.jpg']
- 
-BAD:
- 
-//div[@class='MuiButton-root-123']
- 
-GOOD:
- 
-//button[@aria-label='Search']
- 
-GOOD:
- 
-//label[normalize-space()='Email']/following-sibling::input
- 
-GOOD:
- 
-//section[.//h2[normalize-space()='Customer Details']]//button
- 
-=================================================
-MANDATORY POSITIONAL FALLBACK
-=================================================
- 
-After generating all stable locator candidates:
- 
-1. Stable attribute locator
-2. Text locator
-3. Ancestor locator
-4. Parent-child locator
-5. Sibling or descendant locator
- 
-Generate ONE additional positional fallback locator whenever possible.
- 
-Examples:
- 
-(//button[@aria-label='Search'])[1]
- 
-(//img[@alt='Product Image'])[2]
- 
-(//p[normalize-space()='Discount in bag'])[3]
- 
-Rules:
- 
-✔ The positional locator must always be the LAST candidate.
- 
-✔ The positional locator is a fallback only.
- 
-✔ Stable locators must always be ranked before the positional locator.
- 
-✔ The positional locator should be generated even if stable locators exist.
- 
-✔ The positional locator should use the BEST locator candidate as its base.
- 
-Example:
- 
-Stable locator:
- 
-//p[normalize-space()='Discount in bag']
- 
-Positional fallback:
- 
-(//p[normalize-space()='Discount in bag'])[2]
- 
-Example output:
- 
+
+Return ONLY JSON. No markdown, no commentary.
+
 {
   "locators": [
-    {
-      "xpath": "//p[normalize-space()='Discount in bag']"
-    },
-    {
-      "xpath": "//div[contains(@class,'promotional-message')]//p[normalize-space()='Discount in bag']"
-    },
-    {
-      "xpath": "(//p[normalize-space()='Discount in bag'])[2]"
-    }
+    { "xpath": "//..." }
   ]
 }
- 
--------------------------------------------------
-FINAL DECISION
--------------------------------------------------
- 
-Return 3-5 candidate locators.
- 
-Order them:
- 
+
+Return 3-5 candidate locators ordered:
+
 1. Most stable
 2. Most maintainable
 3. Most readable
 4. Relationship-based fallback
-5. Positional fallback (if required)
- 
-Only use positional locators if every other strategy fails to uniquely identify the target.
- 
+5. Positional fallback (only if required)
+
 Stability is always more important than length.
- 
 `;
+}
+
+export async function getAILocator(data: any, page: Page): Promise<AIResponse> {
+  const context = buildPromptContext(data);
+  const prompt = buildLocatorPrompt(context);
+
+  const response = await client.chat.completions.create({
+    model: process.env.AZURE_OPENAI_DEPLOYMENT!,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You are an expert test automation architect. You output strict JSON only.',
+      },
+      { role: 'user', content: prompt },
+    ],
+    temperature: 0.2,
+  });
+
+  const text = response.choices[0].message.content || '';
+  const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
+
+  let parsed: PromptResult;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    throw new Error('Invalid AI response (not JSON)');
+  }
+
+  const candidates = (Array.isArray(parsed?.locators) ? parsed.locators : [])
+    .map((c) => c?.xpath?.trim())
+    .filter((x): x is string => !!x && x.length > 0);
+
+  if (candidates.length === 0) {
+    return {
+      locator: 'NO_MATCH',
+      confidence: 0,
+      reason: 'No equivalent element found in current DOM',
+    };
+  }
+
+  // Walk candidates in the order the prompt ranked them (stable first,
+  // positional last). Return the first that resolves to exactly one element
+  // on the live page. Positional is therefore only ever reached when no
+  // stable candidate above it validated — genuine last resort.
+  let positionalSeen = false;
+
+  for (const raw of candidates) {
+    const xpath = raw.startsWith('xpath=') ? raw : `xpath=${raw}`;
+    try {
+      if ((await page.locator(xpath).count()) === 1) {
+        const positional = isPositionalXPath(xpath);
+        positionalSeen = positionalSeen || positional;
+        return {
+          locator: xpath,
+          confidence: 1, // prompt returns no score; engine gate needs >= 0.7
+          reason: positional
+            ? `Positional last-resort candidate accepted (no stable candidate validated) — ${candidates.length} returned`
+            : `Top stable candidate that validated uniquely — ${candidates.length} returned`,
+        };
+      }
+    } catch {
+      /* malformed xpath — skip to next candidate */
+    }
+  }
+
+  // Nothing validated uniquely on the page.
+  return {
+    locator: 'NO_MATCH',
+    confidence: 0,
+    reason: `None of ${candidates.length} candidates resolved to a unique element on the current page`,
+  };
 }
