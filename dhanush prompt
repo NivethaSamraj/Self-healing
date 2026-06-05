@@ -1,451 +1,2927 @@
-import OpenAI from 'openai';
-import * as dotenv from 'dotenv';
-import { Page } from '@playwright/test';
-dotenv.config();
+import { test, expect, Page, Locator } from '@playwright/test';
+import * as path from 'path';
+import { pathToFileURL } from 'url';
+import { saveElement, getElement } from '../core/db/elementRepo';
+import { findWithFallback, buildLocator, isValidLocator } from '../core/healing/fallBackEngine';
+import {
+  buildSmartLocatorBundle,
+  captureElementScreenshot,
+  captureFullPageScreenshot,
+  getElementOuterHTML,
+  getMinimalFullDOM,
+} from '../utils/selfHealing';
 
-/** True for XPath that encodes position rather than identity: [2], position(), last(). */
-function isPositionalXPath(xpath: string): boolean {
-  const x = xpath.replace(/^xpath=/, '');
-  return /\[\d+\]/.test(x) || /position\s*\(/i.test(x) || /last\s*\(/i.test(x);
+const htmlPath = path.resolve(__dirname, '..', 'endtoend.html');
+console.log('HTML Path:', htmlPath);
+
+const STORE_URL = pathToFileURL(htmlPath).href;
+const PROMO_CODE = 'SELFHEAL123';
+
+// CAPTURE = bank baseline rows. HEAL = drive actions through DB + fallback engine.
+const MODE = (process.env.MODE ?? 'capture').toLowerCase();
+
+const PACE = { micro: 500, short: 1000, medium: 1800, long: 2600 };
+
+async function settle(page: Page, ms: number = PACE.short): Promise<void> {
+  await page.waitForTimeout(ms);
 }
 
-/**
- * Secrets must come from the environment. The previously inlined key has been
- * shared in plaintext and should be rotated in the Azure portal immediately.
- */
-const client = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_API_KEY!,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: { 'api-version': '2024-02-15-preview' },
-  defaultHeaders: { 'api-key': process.env.AZURE_OPENAI_API_KEY! },
+async function humanScroll(page: Page, pixels: number, steps = 6): Promise<void> {
+  const per = Math.round(pixels / steps);
+  for (let i = 0; i < steps; i++) {
+    await page.mouse.wheel(0, per);
+    await page.waitForTimeout(220);
+  }
+}
+
+/** First visible candidate locator (used only in CAPTURE mode). */
+async function firstVisible(page: Page, candidates: Locator[], timeout = 8000): Promise<Locator> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    for (const c of candidates) {
+      try {
+        if (await c.first().isVisible()) return c.first();
+      } catch { /* try next */ }
+    }
+    await page.waitForTimeout(250);
+  }
+  return candidates[0].first();
+}
+
+/* ===========================================================================
+   CAPTURE: snapshot one element to the DB (writes the baseline you later break)
+   =========================================================================== */
+async function captureElement(
+  page: Page,
+  elementName: string,
+  locator: Locator,
+  primaryLocatorStr: string
+): Promise<void> {
+  try {
+    await locator.first().waitFor({ state: 'visible', timeout: 8000 });
+    const target = locator.first();
+    const bundle = await buildSmartLocatorBundle(target, elementName);
+    const [elementShot, fullPageShot, outerHTML, contextDom] = await Promise.all([
+      captureElementScreenshot(target).catch(() => null),
+      captureFullPageScreenshot(page).catch(() => null),
+      getElementOuterHTML(target).catch(() => ''),
+      getMinimalFullDOM(page).catch(() => ''),
+    ]);
+    await saveElement({
+      elementName,
+      pageUrl: page.url(),
+      primaryLocator: primaryLocatorStr,
+      smartLocators: bundle.smartLocators,
+      meta: bundle.meta,
+      outerHTML,
+      context_dom: contextDom,
+      elementScreenshot: elementShot,
+      fullPageScreenshot: fullPageShot,
+    });
+    console.log(`captured: ${elementName}`);
+  } catch (err: any) {
+    console.warn(`capture failed for ${elementName}: ${err?.message || err}`);
+  }
+}
+
+/* ===========================================================================
+   RESOLVE FROM DB: try DB primary, then DB smart locators (role/css/xpath/...).
+   Returns a usable locator + the strategy that worked, or null if none worked.
+   =========================================================================== */
+async function resolveFromDB(
+  page: Page,
+  elementName: string
+): Promise<{ locator: Locator; strategy: string } | null> {
+  const row = await getElement(elementName);
+  if (!row) {
+    console.warn(`   (no DB row for ${elementName})`);
+    return null;
+  }
+
+  // 1. DB primary
+  if (row.primary_locator) {
+    const primary = buildLocator(page, row.primary_locator);
+    if (primary && (await isValidLocator(primary))) {
+      return { locator: primary, strategy: 'db-primary' };
+    }
+    console.log(`  DB primary failed: ${row.primary_locator}`);
+  }
+
+  // 2. DB smart locators, in priority order
+  const smart =
+    typeof row.smart_locators === 'string'
+      ? JSON.parse(row.smart_locators)
+      : row.smart_locators;
+
+  const priority = ['role', 'testId', 'label', 'placeholder', 'text', 'alt', 'title', 'css', 'xpath'];
+  for (const key of priority) {
+    const locStr = smart?.[key];
+    if (!locStr) continue;
+    const built = buildLocator(page, locStr);
+    if (built && (await isValidLocator(built))) {
+      return { locator: built, strategy: key };
+    }
+    console.log(`  smart [${key}] failed: ${locStr}`);
+  }
+
+  return null; // nothing in the DB worked -> caller should invoke AI fallback
+}
+
+/* ===========================================================================
+   smartAct: the single entry point used in HEAL mode.
+   DB primary -> DB smart locators -> (if all fail) findWithFallback (AI).
+   =========================================================================== */
+async function smartAct(
+  page: Page,
+  elementName: string,
+  action: (loc: Locator) => Promise<void>,
+  label: string
+): Promise<Locator> {
+  console.log(` ${label}`);
+
+  let locator: Locator | null = null;
+  let strategy = '';
+
+  const fromDB = await resolveFromDB(page, elementName);
+  if (fromDB) {
+    locator = fromDB.locator;
+    strategy = fromDB.strategy;
+  } else {
+    // DB primary + all smart locators failed -> AI healing via the engine.
+console.log('');
+console.log('=================================');
+console.log(`AI HEALING INVOKED : ${elementName}`);
+console.log('=================================');    const healed = await findWithFallback(
+      page,
+      elementName,
+      page.locator('body'), // placeholder; engine resolves real locator from DB/AI
+      'novacart-checkout'
+    );
+    locator = healed.locator;
+    strategy = healed.usedStrategy;
+  }
+
+  console.log(`  resolved via [${strategy}]`);
+  await locator.scrollIntoViewIfNeeded();
+  await settle(page, PACE.micro);
+  await action(locator);
+  await settle(page, PACE.short);
+  return locator;
+}
+
+/* ===========================================================================
+   Per-step driver: CAPTURE banks the baseline, HEAL drives through DB/AI.
+   =========================================================================== */
+async function step(
+  page: Page,
+  elementName: string,
+  captureCandidates: Locator[],
+  capturePrimaryStr: string,
+  action: (loc: Locator) => Promise<void>,
+  label: string
+): Promise<void> {
+  if (MODE === 'capture') {
+    const el = await firstVisible(page, captureCandidates);
+    await captureElement(page, elementName, el, capturePrimaryStr);
+    console.log(` ${label}`);
+    await el.scrollIntoViewIfNeeded();
+    await settle(page, PACE.micro);
+    await action(el);
+    await settle(page, PACE.short);
+  } else {
+    await smartAct(page, elementName, action, label);
+  }
+}
+
+const click = (loc: Locator) => loc.click();
+
+test.describe('NovaCart mock store — checkout journey', () => {
+  test.setTimeout(120_000);
+
+  test('Shop, add two products, apply promo, checkout', async ({ page }) => {
+    console.log(`\n### MODE = ${MODE} ###`);
+
+    // 1. Open store
+    console.log('\n=== STEP 1: Open store ===');
+    await page.goto(STORE_URL, { waitUntil: 'domcontentloaded' });
+    await settle(page, PACE.medium);
+    await expect(page).toHaveTitle(/NovaCart/i);
+
+    // 2. Shop Now
+    console.log('\n=== STEP 2: Shop Now ===');
+    await step(page, 'shop_now_button',
+      [page.getByRole('button', { name: /shop now/i }), page.locator('#shop-now')],
+      '#shop-now', click, 'Shop Now (green)');
+
+    // 3. Scroll
+    console.log('\n=== STEP 3: Scroll ===');
+    await humanScroll(page, 700);
+    await settle(page, PACE.medium);
+
+    // 4. Open a product
+    console.log('\n=== STEP 4: Open a product ===');
+    await step(page, 'product_open_link',
+      [page.locator('[data-open-product]'), page.locator('.product-link')],
+      '.product-link', click, 'Open product detail');
+    await expect(page.locator('#product-overlay')).toHaveClass(/open/);
+
+    // 5 & 6. Size + Add to Bag
+    console.log('\n=== STEP 5/6: Size & Add to Bag ===');
+    await step(page, 'size_swatch_first',
+      [page.locator('#m-sizes .size-btn:not([disabled])')],
+      '#m-sizes .size-btn:not([disabled])', click, 'Select first available size');
+    await step(page, 'add_to_bag_button',
+      [page.getByRole('button', { name: /add to bag/i }), page.locator('#add-to-bag')],
+      '#add-to-bag', click, 'Add to Bag (red)');
+    await settle(page, PACE.medium);
+    await expect(page.locator('#cart-count')).toHaveText('1');
+
+    // 7. Continue Shopping
+    console.log('\n=== STEP 7: Continue Shopping ===');
+    await step(page, 'continue_shopping_button',
+      [page.getByRole('button', { name: /continue shopping/i }), page.locator('#continue-shopping')],
+      '#continue-shopping', click, 'Continue Shopping');
+
+    // 8. Clothing -> Tees & Knits
+    console.log('\n=== STEP 8: Clothing > Tees & Knits ===');
+    const clothingMenu = page.locator('[data-menu="clothing"]');
+
+await clothingMenu.hover();
+
+await page.locator('[data-nav="tees-knits"]').click();
+
+    // 9. Sort -> Rating
+    console.log('\n=== STEP 9: Sort by Rating ===');
+    await step(page, 'sort_select',
+      [page.locator('#sort-select'), page.getByRole('combobox', { name: /sort/i }), page.locator('select[name="sort"]')],
+      '#sort-select', (loc) => loc.selectOption('rating'), 'Sort by Rating');
+    await settle(page, PACE.medium);
+
+    // 10. First sorted product
+    console.log('\n=== STEP 10: Open first product ===');
+    await step(page, 'first_sorted_product',
+      [page.locator('#product-grid [data-open-product]').first(), page.locator('.product-link').first()],
+      '#product-grid .product-link', click, 'Open first sorted product');
+    await expect(page.locator('#product-overlay')).toHaveClass(/open/);
+
+    // 11. Size + Add to Bag (2nd)
+    console.log('\n=== STEP 11: Size & Add to Bag (2nd) ===');
+    await step(page, 'size_swatch_first',
+      [page.locator('#m-sizes .size-btn:not([disabled])')],
+      '#m-sizes .size-btn:not([disabled])', click, 'Select first available size');
+    await step(page, 'add_to_bag_button',
+      [page.getByRole('button', { name: /add to bag/i }), page.locator('#add-to-bag')],
+      '#add-to-bag', click, 'Add to Bag (red)');
+    await settle(page, PACE.medium);
+    await expect(page.locator('#cart-count')).toHaveText('2');
+
+    // 12. View Bag & Checkout
+    console.log('\n=== STEP 12: View Bag & Checkout ===');
+    await step(page, 'view_bag_button',
+      [page.getByRole('button', { name: /view bag.*checkout|view bag/i }), page.locator('#view-bag')],
+      '#view-bag', click, 'View Bag & Checkout');
+    await expect(page.locator('#cart-page')).toHaveClass(/active/);
+
+    // 13. Promo code
+    console.log('\n=== STEP 13: Enter promo code ===');
+    await step(page, 'promo_input',
+      [page.getByPlaceholder(/promo/i), page.locator('#promo-input'), page.locator('input[name="promoCode"]')],
+      '#promo-input',
+      async (loc) => { await loc.fill(''); await loc.type(PROMO_CODE, { delay: 110 }); },
+      'Enter promo code');
+    await settle(page, PACE.short);
+
+    // 14. Apply promo
+    console.log('\n=== STEP 14: Apply promo ===');
+    await step(page, 'apply_promo_button',
+      [page.getByRole('button', { name: /^apply$/i }), page.locator('#apply-promo')],
+      '#apply-promo', click, 'Apply promo');
+    await expect(page.locator('#promo-msg')).toBeVisible();
+    console.log('   promo result:', await page.locator('#promo-msg').textContent());
+    await settle(page, PACE.medium);
+
+    // 15. Checkout
+    console.log('\n=== STEP 15: Checkout ===');
+    await step(page, 'checkout_button',
+      [page.getByRole('button', { name: /^checkout$/i }), page.locator('#checkout-btn')],
+      '#checkout-btn', click, 'Checkout');
+
+    await expect(page.locator('#checkout-overlay')).toHaveClass(/open/);
+    await expect(page.locator('#checkout-heading')).toHaveText(/order confirmed/i);
+    console.log('\nReached checkout confirmation. Total:',
+      await page.locator('#checkout-total').textContent());
+
+    await settle(page, PACE.long);
+  });
 });
 
-/**
- * Return contract is unchanged so fallBackEngine.ts needs no edits.
- * The manager's prompt returns a candidate ARRAY of xpaths; we pick the first
- * one and surface it through this same shape. confidence is synthesised:
- *   - 1   when the model returned a usable candidate
- *   - 0   when the model returned NO_MATCH / nothing
- */
+
+fallbackEngine.ts
+import { Page, Locator } from '@playwright/test';
+import { getElement } from '../db/elementRepo';
+import { getAILocator } from '../ai/aiHealing';
+import { saveHealingLog } from '../db/healingRepo';
+import { getMinimalFullDOM } from '../../utils/selfHealing';
+import { HealingLogger } from '../../utils/healingLogger';
+import { containsDynamicId } from '../../utils/selfHealing';
+
+//  TYPE FIRST
+type FallbackResult = {
+  locator: Locator;
+  usedStrategy: string;
+};
+
+export async function findWithFallback(
+  page: Page,
+  elementName: string,
+  primaryLocator: Locator,
+  testName: string = 'default-test'
+): Promise<FallbackResult> {
+
+  const attempted: string[] = [];
+
+  // =========================================================
+  // START LOGGING
+  // =========================================================
+
+  HealingLogger.info('Test', testName);
+  HealingLogger.info('Element', elementName);
+  HealingLogger.info('Page', page.url());
+
+  HealingLogger.info('AI SELF-HEALING STARTED', 'Azure_OpenAI');
+
+  // =========================================================
+  // STEP 1 — FETCH ELEMENT FROM DB
+  // =========================================================
+
+  HealingLogger.subSection(
+    'STEP 1 — DATABASE PRIMARY LOCATOR'
+  );
+
+  const element = await getElement(elementName);
+
+  if (!element) {
+
+    HealingLogger.fail(
+      `No locator data found for ${elementName}`
+    );
+
+    throw new Error(
+      `No locator data found for ${elementName}`
+    );
+  }
+
+  const dbPrimaryLocatorStr = element.primary_locator;
+
+  if (dbPrimaryLocatorStr) {
+
+    HealingLogger.info(
+      'Trying',
+      dbPrimaryLocatorStr
+    );
+
+    const dbPrimary = buildLocator(
+      page,
+      dbPrimaryLocatorStr
+    );
+
+    if (
+      dbPrimary &&
+      await isValidLocator(dbPrimary)
+    ) {
+
+      HealingLogger.success(
+        `DB Primary locator worked`
+      );
+
+      await saveHealingLog({
+        elementName,
+        testName,
+        failedLocator: 'POM_PRIMARY',
+        attemptedLocators: attempted,
+        healedLocator: dbPrimaryLocatorStr,
+        strategy: 'db-primary',
+        status: 'HEALED',
+        errorMessage: null,
+      });
+
+      return {
+        locator: dbPrimary,
+        usedStrategy: 'db-primary',
+      };
+    }
+
+    attempted.push('db-primary');
+
+    HealingLogger.fail(
+      `DB Primary locator failed`
+    );
+  }
+
+  // =========================================================
+  // STEP 2 — SMART LOCATOR FALLBACK
+  // =========================================================
+
+  HealingLogger.subSection(
+    'STEP 2 — SMART LOCATOR FALLBACK'
+  );
+
+  const smartLocators =
+    typeof element.smart_locators === 'string'
+      ? JSON.parse(element.smart_locators)
+      : element.smart_locators;
+
+  const priority = [
+    'role',
+    'testId',
+    'label',
+    'placeholder',
+    'text',
+    'alt',
+    'title',
+    'css',
+    'xpath'
+  ];
+
+  for (const key of priority) {
+
+    const locatorStr = smartLocators?.[key];
+
+    if (!locatorStr) continue;
+
+    attempted.push(key);
+
+    HealingLogger.info(
+      'Strategy',
+      key
+    );
+
+    HealingLogger.info(
+      'Locator',
+      locatorStr
+    );
+
+    const built = buildLocator(
+      page,
+      locatorStr
+    );
+
+    if (!built) {
+
+      HealingLogger.fail(
+        'Failed to build locator'
+      );
+
+      continue;
+    }
+
+    const valid = await isValidLocator(built);
+
+    HealingLogger.info(
+      'Result',
+      valid ? 'SUCCESS' : 'FAILED'
+    );
+
+    if (valid) {
+
+      HealingLogger.success(
+        `Element healed using ${key}`
+      );
+
+      await saveHealingLog({
+        elementName,
+        testName,
+        failedLocator: primaryLocator,
+        attemptedLocators: attempted,
+        healedLocator: locatorStr,
+        strategy: key,
+        status: 'HEALED',
+        errorMessage: null,
+      });
+
+      HealingLogger.section(
+        'HEALING COMPLETED'
+      );
+
+      return {
+        locator: built,
+        usedStrategy: key,
+      };
+    }
+  }
+
+  // =========================================================
+  // STEP 3 — AI HEALING
+  // =========================================================
+
+  HealingLogger.subSection(
+    'STEP 3 — AI HEALING'
+  );
+
+  HealingLogger.ai(
+    'Collecting screenshots and DOM context'
+  );
+
+  try {
+
+    // =========================================================
+    // CURRENT SCREENSHOT
+    // =========================================================
+
+    const screenshotBuffer =
+      await page.screenshot({
+        fullPage: true
+      });
+
+    const currentPageScreenshot =
+      screenshotBuffer.toString('base64');
+
+    // =========================================================
+    // OLD ELEMENT SCREENSHOT
+    // =========================================================
+
+    const oldElementScreenshot =
+      element?.element_screenshot
+        ? Buffer
+          .from(element.element_screenshot)
+          .toString('base64')
+        : null;
+
+    // =========================================================
+    // OLD FULL PAGE SCREENSHOT
+    // =========================================================
+
+    const oldPageScreenshot =
+      element?.full_page_screenshot
+        ? Buffer
+          .from(element.full_page_screenshot)
+          .toString('base64')
+        : null;
+
+    // =========================================================
+    // OLD OUTER HTML
+    // =========================================================
+
+    const oldOuterHTML =
+      element?.outer_html || '';
+
+    if (!oldOuterHTML) {
+
+      HealingLogger.warn(
+        'No stored outerHTML found'
+      );
+    }
+
+    HealingLogger.ai(
+      'Sending healing request to AI model'
+    );
+
+    // =========================================================
+    // AI CALL
+    // =========================================================
+
+    const aiResponse = await getAILocator({
+      elementName,
+      failedLocator: primaryLocator.toString(),
+      smartLocators,
+      oldOuterHTML: element.outer_html,
+      oldDOM: element.context_dom,
+      newDOM: await getMinimalFullDOM(page),
+      currentPageScreenshot,
+      oldPageScreenshot,
+      oldElementScreenshot,
+      meta: element?.meta || {},
+    });
+
+    // =========================================================
+    // AI RESPONSE LOGGING
+    // =========================================================
+
+    HealingLogger.ai(
+      `Locator      : ${aiResponse?.locator}`
+    );
+
+    HealingLogger.ai(
+      `Confidence   : ${aiResponse?.confidence}`
+    );
+
+    HealingLogger.ai(
+      `Reason       : ${aiResponse?.reason}`
+    );
+
+    // =========================================================
+    // VALIDATE AI RESPONSE
+    // =========================================================
+
+    if (
+      !aiResponse ||
+      !aiResponse.locator
+    ) {
+
+      throw new Error(
+        'AI returned empty or invalid response'
+      );
+    }
+
+    // =========================================================
+    // CONFIDENCE CHECK
+    // =========================================================
+
+    if (aiResponse.confidence < 0.7) {
+
+      throw new Error(
+        `Low confidence AI response: ${aiResponse.confidence}`
+      );
+    }
+
+    // =========================================================
+    // BUILD AI LOCATOR
+    // =========================================================
+
+    if (
+      containsDynamicId(
+        aiResponse.locator
+      )
+    ) {
+
+      throw new Error(
+        'AI returned dynamic locator'
+      );
+    }
+
+    const aiLocator = buildLocator(
+      page,
+      aiResponse.locator
+    );
+
+    if (!aiLocator) {
+
+      throw new Error(
+        'Failed to build locator from AI response'
+      );
+    }
+
+    // =========================================================
+    // VALIDATE AI LOCATOR
+    // =========================================================
+
+    const isValid =
+      await isValidLocator(aiLocator);
+
+    if (isValid) {
+
+      HealingLogger.subSection(
+        'HEALING SUCCESS'
+      );
+
+      HealingLogger.success(
+        'AI locator validated successfully'
+      );
+
+      HealingLogger.info(
+        'Final Locator',
+        aiResponse.locator
+      );
+
+      HealingLogger.info(
+        'Confidence',
+        aiResponse.confidence
+      );
+
+      await saveHealingLog({
+        elementName,
+        testName,
+        failedLocator: primaryLocator.toString(),
+        attemptedLocators: attempted,
+        healedLocator: aiResponse.locator,
+        strategy: 'AI',
+        status: 'AI_HEALED',
+        errorMessage: null,
+      });
+
+      HealingLogger.section(
+        'HEALING COMPLETED'
+      );
+
+      return {
+        locator: aiLocator,
+        usedStrategy: 'AI',
+      };
+    }
+
+    throw new Error(
+      'AI locator is not valid on current page'
+    );
+
+  } catch (error: any) {
+
+    HealingLogger.subSection(
+      'HEALING FAILED'
+    );
+
+    HealingLogger.fail(
+      error?.message || 'Unknown healing error'
+    );
+
+    await saveHealingLog({
+      elementName,
+      testName,
+      failedLocator: primaryLocator.toString(),
+      attemptedLocators: attempted,
+      healedLocator: null,
+      strategy: 'AI',
+      status: 'FAILED',
+      errorMessage: error?.message || 'Unknown error',
+    });
+
+    throw new Error(
+      `All locator strategies including AI failed for ${elementName}`
+    );
+  }
+}
+
+export function buildLocator(page: Page, locatorStr: string): Locator | null {
+  try {
+    // getByRole
+
+    if (locatorStr.startsWith('getByRole')) {
+
+
+     const roleMatch = locatorStr.match(
+  /getByRole\(\s*['"](.*?)['"]\s*,\s*\{[\s\S]*?name\s*:\s*['"](.*?)['"]/
+);
+
+      if (roleMatch) {
+
+        const role = roleMatch[1]?.trim();
+
+        const name = roleMatch[2]?.trim();
+
+        return page.getByRole(
+          role as any,
+          {
+            name,
+            exact: true,
+          }
+        );
+      }
+
+      console.warn(
+        `Failed to parse getByRole locator: ${locatorStr}`
+      );
+    }
+
+    if (
+      locatorStr.startsWith(
+        'getByTestId'
+      )
+    ) {
+
+      const val =
+        locatorStr.match(
+          /getByTestId\(\s*['"](.*?)['"]/
+        )?.[1];
+
+      if (val) {
+
+        return page.getByTestId(
+          val
+        );
+      }
+    }
+
+    // getByText
+    if (locatorStr.startsWith('getByText')) {
+      const text = locatorStr.match(/getByText\(\s*['"](.*?)['"]/)?.[1];
+      if (text) return page.getByText(text, { exact: true });
+    }
+
+    // getByPlaceholder
+    if (locatorStr.startsWith('getByPlaceholder')) {
+      const val = locatorStr.match(/getByPlaceholder\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByPlaceholder(new RegExp(`^${escapeRegex(val)}$`));
+      }
+    }
+
+    // getByLabel
+    if (locatorStr.startsWith('getByLabel')) {
+      const val = locatorStr.match(/getByLabel\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByLabel(val, { exact: true });
+      }
+    }
+
+    // getByAltText
+    if (locatorStr.startsWith('getByAltText')) {
+      const val = locatorStr.match(/getByAltText\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByAltText(val, { exact: true });
+      }
+    }
+
+    // getByTitle
+    if (locatorStr.startsWith('getByTitle')) {
+      const val = locatorStr.match(/getByTitle\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByTitle(val, { exact: true });
+      }
+    }
+
+    // CSS / XPath fallback
+    return page.locator(locatorStr);
+
+  } catch {
+    return null;
+  }
+}
+
+// Validate locator safely
+export async function isValidLocator(
+  locator: Locator
+): Promise<boolean> {
+  try {
+
+    const count = await locator.count();
+
+    if (count === 0) {
+      HealingLogger.warn(
+        'Locator matched 0 elements'
+      );
+      return false;
+    }
+
+    if (count > 1) {
+      HealingLogger.warn(
+        `Locator matched ${count} elements`
+      );
+      return false;
+    }
+
+    await locator.waitFor({
+      state: 'visible',
+      timeout: 3000,
+    });
+
+    return true;
+
+  } catch (error: any) {
+
+    HealingLogger.warn(
+      `Locator validation failed: ${error.message}`
+    );
+
+    return false;
+  }
+}
+function escapeRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+aiHealing.ts
+import OpenAI from 'openai';
+import * as dotenv from 'dotenv';
+dotenv.config();
+
+const client = new OpenAI({
+  apiKey: "9RHwcaOLWs773i7s8W1VIO6IrgIbsRuWP4Uh32Dx4lYCjPnleGlBJQQJ99BEACHYHv6XJ3w3AAABACOGgGw3",
+  baseURL: "https://testingsl1.openai.azure.com/openai/deployments/gpt-4.1",
+  defaultQuery: {
+    "api-version": "2024-02-15-preview",
+  },
+  defaultHeaders: {
+    "api-key": "9RHwcaOLWs773i7s8W1VIO6IrgIbsRuWP4Uh32Dx4lYCjPnleGlBJQQJ99BEACHYHv6XJ3w3AAABACOGgGw3",
+  },
+});
+
 type AIResponse = {
   locator: string;
   confidence: number;
   reason: string;
 };
 
-type LocatorCandidate = { xpath: string };
-type PromptResult = { locators: LocatorCandidate[] };
-
-/**
- * Build the prompt context expected by the manager's template from the flat
- * data object that fallBackEngine passes in. Anything missing degrades to ''.
- */
-function buildPromptContext(data: any) {
-  const meta = data?.meta || {};
-  const ancestorsHtml = Array.isArray(meta.ancestors)
-    ? meta.ancestors
-        .map((a: any) =>
-          `<${a.tag}${a.id ? ` id="${a.id}"` : ''}${a.name ? ` name="${a.name}"` : ''}${a.ariaLabel ? ` aria-label="${a.ariaLabel}"` : ''}>`
-        )
-        .join('\n')
-    : '';
-
-  const siblings = Array.isArray(meta.siblings) ? meta.siblings : [];
-
-  return {
-    target: {
-      html: data.oldOuterHTML || meta.outerHTML || '',
-      attributes: {
-        tag: meta.tag,
-        id: meta.id,
-        name: meta.name,
-        testId: meta.testId,
-        ariaLabel: meta.label,
-        placeholder: meta.placeholder,
-        text: meta.text,
-        alt: meta.alt,
-        title: meta.title,
-        role: meta.role,
-        type: meta.type,
-      },
-    },
-    context: {
-      ancestorsHtml,
-      previousSibling: siblings[0] ? JSON.stringify(siblings[0]) : '',
-      nextSibling: siblings[1] ? JSON.stringify(siblings[1]) : '',
-      firstChild: '',
-    },
-    // CURRENT dom is the source of truth for the new prompt.
-    minimizedDom: data.newDOM || '',
-  };
-}
 
-export function buildLocatorPrompt(context: any): string {
-  return `
-You are an Expert Test Automation Architect.
+export async function getAILocator(data: any): Promise<AIResponse> {
 
-GOAL
+  const prompt = `
+You are a Playwright locator expert.
 
-The locator must be:
+Goal:
+Generate a UNIQUE, STABLE, and RELIABLE locator for the target element.
 
-✔ Unique
-✔ Stable
-✔ Human-readable
-✔ Maintainable
-✔ Resistant to UI changes
+========================
+CONTEXT
+========================
 
-=================================================
-LOCATOR GENERATION STRATEGY
-===========================
+Element Name:
+${data.elementName}
 
-Use the first valid strategy:
+Failed Locator:
+${data.failedLocator}
 
-1. Stable target attributes
+Previous Smart Locators:
+${JSON.stringify(data.smartLocators)}
 
-Prefer:
+Element Metadata:
+${JSON.stringify(data.meta)}
 
-* data-testid
-* data-test
-* aria-label
-* aria-labelledby
-* name
-* placeholder
-* title
-* alt
-* stable id
+------------------------
+OLD ELEMENT SNAPSHOT
+------------------------
+${data.oldOuterHTML}
 
-Examples:
+------------------------
+OLD PAGE DOM
+------------------------
+${data.oldDOM}
 
-//button[@data-testid='save']
+------------------------
+CURRENT PAGE DOM
+------------------------
+${data.newDOM}
 
-//input[@name='username']
+------------------------
+VISUAL CONTEXT
+------------------------
 
-=================================================
-2. Visible Text
-===============
+OLD ELEMENT SCREENSHOT (base64):
+${data.oldElementScreenshot || 'Not available'}
 
-Examples:
+OLD FULL PAGE SCREENSHOT (base64):
+${data.oldPageScreenshot || 'Not available'}
 
-//button[normalize-space()='Save']
+CURRENT FULL PAGE SCREENSHOT (base64):
+${data.currentPageScreenshot || 'Not available'}
 
-//span[contains(normalize-space(.),'Customer')]
+========================
+INSTRUCTIONS
+========================
 
-=================================================
-3. Ancestor Scoped Locator
-==========================
+Before returning a locator:
 
-If the target itself is not unique:
+1. Verify the locator exists in CURRENT DOM.
 
-Use the nearest stable ancestor and scope to the target.
+2. Verify it matches exactly one element.
 
-Examples:
+3. Do not use an attribute from OLD DOM
+unless that same attribute appears in CURRENT DOM.
 
-//form[@data-testid='customer-form']//button[@type='submit']
+Step 1:
+Locate the element in the OLD PAGE DOM using the OLD ELEMENT SNAPSHOT.
 
-//section[.//h2[normalize-space()='Customer Details']]//input[@name='email']
+Step 2:
+Use OLD ELEMENT SCREENSHOT to understand exact visual identity.
 
-=================================================
-4. Parent Child Relationship
-============================
+Step 3:
+Use OLD FULL PAGE SCREENSHOT to understand layout and position.
 
-Examples:
+Step 4:
+Compare with CURRENT FULL PAGE SCREENSHOT and CURRENT DOM.
 
-//div[@aria-label='Account Menu']//button
+Step 5:
+Find the MOST SIMILAR element in CURRENT PAGE DOM.
 
-=================================================
-5. Sibling Relationship
-=======================
+Step 6:
+Identify changes:
+- id
+- class
+- text
+- structure
+- position
 
-Examples:
+Step 7:
+Generate the BEST locator.
 
-//label[normalize-space()='Email']/parent::*//input
+========================
+RULES (STRICT)
+========================
 
-//span[normalize-space()='Address']/parent::*//input
+- Locator MUST match EXACTLY ONE element
+- Prefer in order:
+  1. getByRole(role, { name })
+  2. getByLabel()
+  3. getByPlaceholder()
+  4. getByText() (exact match)
+- Use CSS selector if needed
+- Avoid XPath unless absolutely necessary
+- Avoid dynamic attributes
+- Use exact matching wherever possible
 
-=================================================
-SVG RULE
-========
 
-If the target element is:
+Before returning a locator:
 
-- svg
-- path
-- circle
-- rect
-- polygon
-- g
+1. Verify the locator exists in CURRENT DOM.
 
-DO NOT generate a locator for the SVG itself.
+2. Verify it matches exactly one element.
 
-Instead:
+3. Do not use an attribute from OLD DOM
+unless that same attribute appears in CURRENT DOM.
 
-Find the nearest clickable parent.
-
-GOOD:
-//a[@aria-label='Sign in to your Account']
-
-GOOD:
-//button[@aria-label='Search']
-
-BAD:
-//a[@aria-label='Sign in to your Account']//svg
-
-BAD:
-//svg[@role='presentation']
-
-BAD:
-//path
-
-=================================================
-DYNAMIC VALUE DETECTION
-=================================================
-
-Treat these values as unstable:
-
-- UUIDs
-- hashes
-- generated ids
-- image URLs
-- image filenames
-- CDN URLs
-- src
-- srcset
-- data-src
-- data-srcset
-
-Never use these. Instead locate using ancestor, parent, sibling,
-descendant, heading, label, or nearby text.
-
-For IMAGE elements: DO NOT identify the image. Identify the BUSINESS
-CONTEXT around the image (nearest heading / section / card / category /
-product title).
-
-GOOD:
-//section[.//h2[normalize-space()='Tees & Knits']]//img
-
-BAD:
-//img[@src='...']
-
-=================================================
-FORBIDDEN ATTRIBUTES
-====================
-
-Never use:
-
-❌ class
-❌ style
-❌ href
-❌ role
-❌ tabindex
-❌ src
-❌ srcset
-❌ data-src
-❌ data-srcset
-❌ aria-hidden
-❌ aria-expanded
-❌ aria-selected
-
-=================================================
-POSITIONAL LOCATOR FALLBACK
-=================================================
-
-Positional locators are NOT preferred. Always try first:
-
-1. Stable target attributes
-2. Visible text
-3. Ancestor scoped locator
-4. Parent-child relationship
-5. Sibling relationship
-6. Descendant relationship
-
-Only if ALL of the above fail to produce a unique locator MAY you
-generate a positional locator, e.g. (//button)[2], (//img)[4].
-
-Rules:
-✔ Positional locators must always be ranked LAST.
-✔ Stable locators must always be preferred.
-✔ Never choose a positional locator when a stable locator exists.
-
-=================================================
-QUALITY GATE
-=================================================
-
-Before returning:
-
-✔ Locator must exist in the CURRENT (minimized) DOM below.
-✔ Locator should uniquely identify the target.
-✔ Locator should avoid dynamic values.
-✔ Locator should prefer semantic relationships and stable attributes.
-✔ Locator should avoid positional locators whenever possible.
-
-The CURRENT minimized DOM is the source of truth. Never use an attribute
-that does not literally appear in it. If no equivalent element can be
-found, return an empty locators array.
-
-=================================================
-TARGET CONTEXT
-==============
-
-Target:
-${context.target.html}
-
-Target Attributes:
-${JSON.stringify(context.target.attributes, null, 2)}
-
-Ancestors:
-${context.context.ancestorsHtml}
-
-Previous Sibling:
-${context.context.previousSibling}
-
-Next Sibling:
-${context.context.nextSibling}
-
-First Child:
-${context.context.firstChild}
-
-Minimized DOM:
-${context.minimizedDom}
-
-=================================================
-OUTPUT FORMAT
-=============
-
-Return ONLY JSON. No markdown, no commentary.
+========================
+OUTPUT FORMAT (STRICT JSON ONLY)
+========================
 
 {
-  "locators": [
-    { "xpath": "//..." }
-  ]
+  "locator": "...",
+  "confidence": 0-1,
+  "reason": "Why this locator uniquely identifies the element based on OLD vs NEW comparison"
 }
 
-Return 3-5 candidate locators ordered:
+CRITICAL:
 
-1. Most stable
-2. Most maintainable
-3. Most readable
-4. Relationship-based fallback
-5. Positional fallback (only if required)
+Never return a locator based solely on OLD DOM.
 
-Stability is always more important than length.
+The locator MUST be derivable from CURRENT DOM.
+
+Before suggesting a locator:
+
+1. Verify it exists in CURRENT DOM.
+2. Verify it uniquely identifies one element.
+3. Prefer CURRENT attributes over OLD attributes.
+4. Use OLD DOM only to understand intent.
+
+IMPORTANT:
+
+The CURRENT DOM is the source of truth.
+
+Never assume an attribute exists.
+
+Only use attributes that literally appear
+inside CURRENT PAGE DOM.
+
+If a locator would match zero elements,
+do not return it.
+
+If the original element cannot be confidently
+mapped to a current element, return:
+
+{
+  "locator":"NO_MATCH",
+  "confidence":0,
+  "reason":"No equivalent element found"
+}
 `;
-}
-
-export async function getAILocator(data: any, page: Page): Promise<AIResponse> {
-  const context = buildPromptContext(data);
-  const prompt = buildLocatorPrompt(context);
 
   const response = await client.chat.completions.create({
     model: process.env.AZURE_OPENAI_DEPLOYMENT!,
     messages: [
-      {
-        role: 'system',
-        content:
-          'You are an expert test automation architect. You output strict JSON only.',
-      },
+      { role: 'system', content: 'You generate Playwright locators' },
       { role: 'user', content: prompt },
     ],
     temperature: 0.2,
   });
 
   const text = response.choices[0].message.content || '';
-  const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
 
-  let parsed: PromptResult;
+  const cleaned = text
+    .replace(/```json/g, '')
+    .replace(/```/g, '')
+    .trim();
+
   try {
-    parsed = JSON.parse(cleaned);
+
+    return JSON.parse(cleaned);
   } catch {
-    throw new Error('Invalid AI response (not JSON)');
+    throw new Error('Invalid AI response');
   }
+}
 
-  const candidates = (Array.isArray(parsed?.locators) ? parsed.locators : [])
-    .map((c) => c?.xpath?.trim())
-    .filter((x): x is string => !!x && x.length > 0);
+elementRepo.ts
+import { pool } from './db';
 
-  if (candidates.length === 0) {
-    return {
-      locator: 'NO_MATCH',
-      confidence: 0,
-      reason: 'No equivalent element found in current DOM',
-    };
-  }
+export async function saveElement(data: any) {
+  const query = `
+    INSERT INTO elements 
+    (element_name, page_url, primary_locator, smart_locators, meta, outer_html, context_dom, element_screenshot, full_page_screenshot)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    ON CONFLICT (element_name)
+    DO UPDATE SET
+      page_url = EXCLUDED.page_url,
+      primary_locator = EXCLUDED.primary_locator,
+      smart_locators = EXCLUDED.smart_locators,
+      meta = EXCLUDED.meta,
+      outer_html = COALESCE(NULLIF(EXCLUDED.outer_html, ''), elements.outer_html),
+      context_dom = COALESCE(NULLIF(EXCLUDED.context_dom, ''), elements.context_dom),
+      element_screenshot = COALESCE(EXCLUDED.element_screenshot, elements.element_screenshot),
+      full_page_screenshot = COALESCE(EXCLUDED.full_page_screenshot, elements.full_page_screenshot),
+      updated_at = CURRENT_TIMESTAMP
+    RETURNING *;
+  `;
 
-  // Walk candidates in the order the prompt ranked them (stable first,
-  // positional last). Return the first that resolves to exactly one element
-  // on the live page. Positional is therefore only ever reached when no
-  // stable candidate above it validated — genuine last resort.
-  let positionalSeen = false;
+  const result = await pool.query(query, [
+    data.elementName,
+    data.pageUrl,
+    data.primaryLocator,
+    JSON.stringify(data.smartLocators ?? {}),
+    JSON.stringify(data.meta ?? {}),
+    data.outerHTML ?? null,
+    data.context_dom ?? null,
+    data.elementScreenshot ?? null,    
+    data.fullPageScreenshot ?? null,    
+  ]);
 
-  for (const raw of candidates) {
-    const xpath = raw.startsWith('xpath=') ? raw : `xpath=${raw}`;
-    try {
-      if ((await page.locator(xpath).count()) === 1) {
-        const positional = isPositionalXPath(xpath);
-        positionalSeen = positionalSeen || positional;
-        return {
-          locator: xpath,
-          confidence: 1, // prompt returns no score; engine gate needs >= 0.7
-          reason: positional
-            ? `Positional last-resort candidate accepted (no stable candidate validated) — ${candidates.length} returned`
-            : `Top stable candidate that validated uniquely — ${candidates.length} returned`,
-        };
-      }
-    } catch {
-      /* malformed xpath — skip to next candidate */
-    }
-  }
+  console.log("SAVED ELEMENT:", {
+    name: result.rows[0]?.element_name,
+    hasOuterHTML: !!result.rows[0]?.outer_html,
+    hasScreenshot: !!result.rows[0]?.element_screenshot,
+  });
 
-  // Nothing validated uniquely on the page.
+  return result.rows[0];
+}
+
+export async function getElement(elementName: string) {
+  const query = `SELECT * FROM elements WHERE element_name = $1`;
+  const result = await pool.query(query, [elementName]);
+  return result.rows[0] || null;
+}
+
+healingRepo.ts
+import { pool } from './db';
+
+export async function saveHealingLog(data: any) {
+  const query = `
+    INSERT INTO healing_logs
+    (element_name, test_name, failed_locator, attempted_locators, healed_locator, strategy, status, error_message)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+  `;
+
+  await pool.query(query, [
+    data.elementName,
+    data.testName,
+    data.failedLocator,
+    JSON.stringify(data.attemptedLocators),
+    data.healedLocator,
+    data.strategy,
+    data.status,
+    data.errorMessage,
+  ]);
+}
+
+selfHealing.ts
+import { Locator, Page } from '@playwright/test';
+
+export async function buildSmartLocatorBundle(
+  locator: Locator,
+  elementName: string
+) {
+
+  const meta =
+    await extractElementMeta(
+      locator
+    );
+
+  const smartLocators =
+    await generateSmartLocators(
+      locator.page(),
+      meta
+    );
+
   return {
-    locator: 'NO_MATCH',
-    confidence: 0,
-    reason: `None of ${candidates.length} candidates resolved to a unique element on the current page`,
+    elementName,
+    meta,
+    smartLocators,
+    timestamp:
+      new Date()
+        .toISOString()
   };
 }
 
+async function generateAncestorXpath(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
+
+  if (!meta.ancestors?.length) {
+    return undefined;
+  }
+
+  for (const ancestor of meta.ancestors) {
+
+    const anchors = [
+      {
+        attr: 'aria-label',
+        value: ancestor.ariaLabel
+      },
+      {
+        attr: 'name',
+        value: ancestor.name
+      },
+      {
+        attr: 'id',
+        value: ancestor.id
+      }
+    ];
+
+    for (const anchor of anchors) {
+
+      if (
+        !anchor.value ||
+        !isCleanValue(
+          anchor.value,
+          anchor.attr
+        )
+      ) {
+        continue;
+      }
+
+      let xp: string | undefined;
+
+      if (
+        meta.name &&
+        isCleanValue(
+          meta.name,
+          'name'
+        )
+      ) {
+
+        xp =
+          anchor.attr === 'id'
+            ? `//*[@id="${anchor.value}"]//${meta.tag}[@name="${meta.name}"]`
+            : `//*[@${anchor.attr}="${anchor.value}"]//${meta.tag}[@name="${meta.name}"]`;
+
+      } else if (
+        meta.placeholder &&
+        isCleanValue(
+          meta.placeholder,
+          'placeholder'
+        )
+      ) {
+
+        xp =
+          anchor.attr === 'id'
+            ? `//*[@id="${anchor.value}"]//${meta.tag}[@placeholder="${meta.placeholder}"]`
+            : `//*[@${anchor.attr}="${anchor.value}"]//${meta.tag}[@placeholder="${meta.placeholder}"]`;
+
+      } else {
+
+        xp =
+          anchor.attr === 'id'
+            ? `//*[@id="${anchor.value}"]//${meta.tag}`
+            : `//*[@${anchor.attr}="${anchor.value}"]//${meta.tag}`;
+      }
+
+      if (!isStableXpath(xp)) {
+        continue;
+      }
+
+      if (
+        await isUniqueXpath(
+          page,
+          xp
+        )
+      ) {
+        return xp;
+      }
+    }
+  }
+
+  return undefined;
+}
 
 
+async function generateScopedCss(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
+
+  if (
+    !meta.ancestors?.length ||
+    !meta.name
+  ) {
+    return undefined;
+  }
+
+  for (
+    const ancestor
+    of meta.ancestors
+  ) {
+
+    if (
+      ancestor.ariaLabel &&
+      isCleanValue(
+        ancestor.ariaLabel,
+        'aria-label'
+      )
+    ) {
+
+      const css =
+        `[aria-label="${ancestor.ariaLabel}"] ${meta.tag}[name="${meta.name}"]`;
+
+      if (
+        await isUniqueCss(
+          page,
+          css
+        )
+      ) {
+
+        return css;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+export async function extractElementMeta(
+  locator: Locator
+) {
+
+  return locator.evaluate((el) => {
+
+    function getAncestorChain(
+      element: Element,
+      depth: number = 5
+    ) {
+
+      const ancestors: any[] = [];
+
+      let current =
+        element.parentElement;
+
+      while (
+        current &&
+        ancestors.length < depth
+      ) {
+
+        ancestors.push({
+          tag:
+            current.tagName.toLowerCase(),
+
+          id:
+            current.getAttribute('id'),
+
+          name:
+            current.getAttribute('name'),
+
+          ariaLabel:
+            current.getAttribute(
+              'aria-label'
+            ),
+
+          class:
+            current.getAttribute(
+              'class'
+            )
+        });
+
+        current =
+          current.parentElement;
+      }
+
+      return ancestors;
+    }
+
+    function getSiblingInfo(
+      element: Element
+    ) {
+
+      return Array.from(
+        element.parentElement?.children || []
+      )
+        .filter(
+          sibling => sibling !== element
+        )
+        .slice(0, 5)
+        .map(sibling => ({
+          tag:
+            sibling.tagName.toLowerCase(),
+
+          text:
+            sibling.textContent
+              ?.trim()
+              ?.substring(0, 100),
+
+          ariaLabel:
+            sibling.getAttribute(
+              'aria-label'
+            ),
+
+          name:
+            sibling.getAttribute(
+              'name'
+            ),
+
+          id:
+            sibling.getAttribute(
+              'id'
+            )
+        }));
+    }
+
+    return {
+
+      tag:
+        el.tagName.toLowerCase(),
+
+      text:
+        el.textContent?.trim(),
+
+      ancestors:
+        getAncestorChain(el),
+
+      siblings:
+        getSiblingInfo(el),
+
+      id:
+        el.getAttribute('id'),
+
+      class:
+        el.getAttribute('class'),
+
+      name:
+        el.getAttribute('name'),
+
+      type:
+        el.getAttribute('type'),
+
+      placeholder:
+        el.getAttribute(
+          'placeholder'
+        ),
+
+      label:
+        el.getAttribute(
+          'aria-label'
+        ),
+
+      role:
+        el.getAttribute(
+          'role'
+        ),
+
+      alt:
+        el.getAttribute(
+          'alt'
+        ),
+
+      title:
+        el.getAttribute(
+          'title'
+        ),
+
+      testId:
+        el.getAttribute(
+          'data-testid'
+        ),
+
+      dataTest:
+        el.getAttribute(
+          'data-test'
+        ),
+
+      value:
+        el.getAttribute(
+          'value'
+        ),
+
+      outerHTML:
+        el.outerHTML
+    };
+  });
+}
+
+export function containsDynamicId(
+  xpath: string
+): boolean {
+
+  const matches =
+    xpath.match(
+      /['"]([^'"]+)['"]/g
+    );
+
+  if (!matches) {
+    return false;
+  }
+
+  return matches.some(m =>
+    isLikelyDynamicValue(
+      m.replace(
+        /['"]/g,
+        ''
+      )
+    )
+  );
+}
+
+/**
+ * Reject:
+ * //input[1]
+ * //div[2]
+ * ancestor::div[3]
+ * following::input[1]
+ */
+
+export function containsXPathIndex(
+  xpath: string
+): boolean {
+
+  return /\[\d+\]/.test(xpath);
+}
+
+/**
+ * Reject positional XPath logic
+ */
+
+export function containsPositionalXPath(
+  xpath: string
+): boolean {
+
+  return (
+    /\[\d+\]/.test(xpath) ||
+    /position\s*\(/i.test(xpath) ||
+    /last\s*\(/i.test(xpath)
+  );
+}
 
 
+export function isStableXpath(
+  xpath: string
+): boolean {
+
+  if (
+    containsDynamicId(xpath)
+  ) {
+
+    console.log(
+      `REJECTED DYNAMIC XPATH: ${xpath}`
+    );
+
+    return false;
+  }
+
+  if (
+    containsPositionalXPath(xpath)
+  ) {
+
+    console.log(
+      `REJECTED INDEXED XPATH: ${xpath}`
+    );
+
+    return false;
+  }
+
+  return true;
+}
 
 
+type SmartLocatorResult = {
+  role?: string;
+  testId?: string;
+  label?: string;
+  placeholder?: string;
+  text?: string;
+  alt?: string;
+  title?: string;
+  css?: string;
+  xpath?: string;
+};
+
+async function isUniqueAlt(
+  page: Page,
+  alt: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByAltText(
+          alt,
+          { exact: true }
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+async function isUniqueTitle(
+  page: Page,
+  title: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByTitle(
+          title,
+          { exact: true }
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+function isLikelyDynamicValue(
+  value: string,
+  attr?: string
+): boolean {
+
+  const v = value.trim();
+
+  // UUID
+
+  if (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}/i.test(v)
+  ) {
+    return true;
+  }
+
+  // Random IDs
+
+  if (
+    /^[A-Za-z0-9_-]{20,}$/.test(v) &&
+    /[A-Z]/.test(v) &&
+    /[a-z]/.test(v) &&
+    /\d/.test(v)
+  ) {
+    return true;
+  }
+
+  // Mixed random string
+
+  if (
+    /[A-Z]/.test(v) &&
+    /[a-z]/.test(v) &&
+    /\d/.test(v) &&
+    v.length > 15
+  ) {
+    return true;
+  }
+
+  // React / Angular / Material
+
+  if (
+    /(react|mui|mat|cdk|ng)/i.test(v) &&
+    /\d/.test(v)
+  ) {
+    return true;
+  }
+
+  // Ends with large number
+
+  if (
+    /[-_]\d{3,}$/.test(v)
+  ) {
+    return true;
+  }
+
+  // Long hashes
+
+  if (
+    /[0-9a-f]{8,}/i.test(v)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function isCleanValue(
+  value: string,
+  attr?: string
+): boolean {
+
+  const t = value.trim();
+
+  if (!t) {
+    return false;
+  }
+
+  const attribute =
+    attr?.toLowerCase() || '';
+
+  // =====================================
+  // DYNAMIC VALUE DETECTION
+  // =====================================
+
+  if (
+    isLikelyDynamicValue(
+      t,
+      attribute
+    )
+  ) {
+    return false;
+  }
+
+  // =====================================
+  // HUMAN READABLE ATTRIBUTES
+  // =====================================
+
+  if (
+    [
+      'aria-label',
+      'placeholder',
+      'title',
+      'alt'
+    ].includes(attribute)
+  ) {
+
+    if (t.length > 120) {
+      return false;
+    }
+
+    return true;
+  }
+
+  // =====================================
+  // ID / NAME / TEST ATTRIBUTES
+  // =====================================
+
+  if (
+    [
+      'id',
+      'name',
+      'data-testid',
+      'data-test'
+    ].includes(attribute)
+  ) {
+
+    if (t.length > 60) {
+      return false;
+    }
+
+    return true;
+  }
+
+  // =====================================
+  // DEFAULT RULES
+  // =====================================
+
+  if (t.length > 60) {
+    return false;
+  }
+
+  return true;
+}
+
+async function isUniquePlaceholder(
+  page: Page,
+  value: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByPlaceholder(
+          value
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+async function isUniqueLabel(
+  page: Page,
+  label: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByLabel(label, {
+          exact: true
+        })
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+async function isUniqueText(
+  page: Page,
+  text: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByText(
+          text,
+          { exact: true }
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+export async function generateSmartLocators(
+  page: Page,
+  meta: any
+): Promise<SmartLocatorResult> {
+
+  const locators: SmartLocatorResult = {};
+
+  // =====================================================
+  // ROLE
+  // =====================================================
+
+  const role = inferRole(meta);
+  const name = getAccessibleName(meta);
+
+  if (
+    role &&
+    name &&
+    isCleanValue(name, 'aria-label') &&
+    await isUniqueRole(page, role, name)
+  ) {
+
+    locators.role =
+      `getByRole('${role}', { name: '${escapeLocatorValue(name)}', exact: true })`;
+  }
+
+  // =====================================================
+  // TEST ID
+  // =====================================================
+
+  if (
+    meta.testId &&
+    isCleanValue(
+      meta.testId,
+      'data-testid'
+    )
+  ) {
+
+    const count =
+      await page
+        .getByTestId(meta.testId)
+        .count();
+
+    if (count === 1) {
+
+      locators.testId =
+        `getByTestId('${escapeLocatorValue(meta.testId)}')`;
+    }
+  }
+
+  // =====================================================
+  // LABEL
+  // =====================================================
+
+  if (
+    meta.label &&
+    isCleanValue(
+      meta.label,
+      'aria-label'
+    ) &&
+    await isUniqueLabel(
+      page,
+      meta.label
+    )
+  ) {
+
+    locators.label =
+      `getByLabel('${escapeLocatorValue(meta.label)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // PLACEHOLDER
+  // =====================================================
+
+  if (
+    meta.placeholder &&
+    isCleanValue(
+      meta.placeholder,
+      'placeholder'
+    ) &&
+    await isUniquePlaceholder(
+      page,
+      meta.placeholder
+    )
+  ) {
+
+    locators.placeholder =
+      `getByPlaceholder('${escapeLocatorValue(meta.placeholder)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // TEXT
+  // =====================================================
+
+  if (
+    meta.text &&
+    meta.text.length < 80 &&
+    !isLikelyDynamicValue(meta.text) &&
+    await isUniqueText(
+      page,
+      meta.text
+    )
+  ) {
+
+    locators.text =
+      `getByText('${escapeLocatorValue(meta.text)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // ALT
+  // =====================================================
+
+  if (
+    meta.alt &&
+    isCleanValue(
+      meta.alt,
+      'alt'
+    ) &&
+    await isUniqueAlt(
+      page,
+      meta.alt
+    )
+  ) {
+
+    locators.alt =
+      `getByAltText('${escapeLocatorValue(meta.alt)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // TITLE
+  // =====================================================
+
+  if (
+    meta.title &&
+    isCleanValue(
+      meta.title,
+      'title'
+    ) &&
+    await isUniqueTitle(
+      page,
+      meta.title
+    )
+  ) {
+
+    locators.title =
+      `getByTitle('${escapeLocatorValue(meta.title)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // CSS
+  // =====================================================
+
+  locators.css =
+  await generateStableCss(
+    page,
+    meta
+  );
+
+if (!locators.css) {
+
+  locators.css =
+    await generateScopedCss(
+      page,
+      meta
+    );
+}
+  // =====================================================
+  // XPATH
+  // =====================================================
+
+ locators.xpath =
+  await generateStableXpath(
+    page,
+    meta
+  );
+
+if (!locators.xpath) {
+
+  locators.xpath =
+    await generateAncestorXpath(
+      page,
+      meta
+    );
+}
+return locators;
+}
+
+function escapeLocatorValue(
+  value: string
+): string {
+
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'");
+}
+
+async function isUniqueXpath(
+  page: Page,
+  xpath: string
+): Promise<boolean> {
+
+  if (!isStableXpath(xpath)) {
+    return false;
+  }
+
+  try {
+
+    const count =
+      await page
+        .locator(`xpath=${xpath}`)
+        .count();
+
+    return count === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+async function generateStableCss(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
+
+  const candidates = [
+
+    {
+      attr: 'data-testid',
+      value: meta.testId
+    },
+
+    {
+      attr: 'data-test',
+      value: meta.dataTest
+    },
+
+    {
+      attr: 'aria-label',
+      value: meta.label
+    },
+
+    {
+      attr: 'placeholder',
+      value: meta.placeholder
+    },
+
+    {
+      attr: 'name',
+      value: meta.name
+    },
+
+    {
+      attr: 'title',
+      value: meta.title
+    },
+
+    {
+      attr: 'alt',
+      value: meta.alt
+    },
+
+    {
+      attr: 'id',
+      value: meta.id
+    }
+  ];
+
+  for (const candidate of candidates) {
+
+    if (
+      !candidate.value ||
+      !isCleanValue(
+        candidate.value,
+        candidate.attr
+      )
+    ) {
+      continue;
+    }
+
+    const selector =
+      candidate.attr === 'id'
+        ? `#${candidate.value}`
+        : `${meta.tag}[${candidate.attr}="${candidate.value}"]`;
+
+    if (
+      await isUniqueCss(
+        page,
+        selector
+      )
+    ) {
+      return selector;
+    }
+  }
+
+  if (meta.class) {
+
+    const stableClass =
+      meta.class
+        .split(' ')
+        .find(
+          (c: string) =>
+            isCleanValue(
+              c,
+              'class'
+            )
+        );
+
+    if (stableClass) {
+
+      const selector =
+        `${meta.tag}.${stableClass}`;
+
+      if (
+        await isUniqueCss(
+          page,
+          selector
+        )
+      ) {
+        return selector;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+async function isUniqueRole(
+  page: Page,
+  role: string,
+  name: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByRole(
+          role as any,
+          {
+            name,
+            exact: true
+          }
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+async function generateStableXpath(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
+
+  const candidates: string[] = [];
+
+  if (
+    meta.testId &&
+    isCleanValue(
+      meta.testId,
+      'data-testid'
+    )
+  ) {
+
+    candidates.push(
+      `//*[@data-testid="${meta.testId}"]`
+    );
+  }
+
+  if (
+    meta.dataTest &&
+    isCleanValue(
+      meta.dataTest,
+      'data-test'
+    )
+  ) {
+
+    candidates.push(
+      `//*[@data-test="${meta.dataTest}"]`
+    );
+  }
+
+  if (
+    meta.name &&
+    isCleanValue(
+      meta.name,
+      'name'
+    )
+  ) {
+
+    candidates.push(
+      `//${meta.tag}[@name="${meta.name}"]`
+    );
+  }
+
+  if (
+    meta.label &&
+    isCleanValue(
+      meta.label,
+      'aria-label'
+    )
+  ) {
+
+    candidates.push(
+      `//${meta.tag}[@aria-label="${meta.label}"]`
+    );
+  }
+
+  if (
+    meta.placeholder &&
+    isCleanValue(
+      meta.placeholder,
+      'placeholder'
+    )
+  ) {
+
+    candidates.push(
+      `//${meta.tag}[@placeholder="${meta.placeholder}"]`
+    );
+  }
+
+  if (
+    meta.title &&
+    isCleanValue(
+      meta.title,
+      'title'
+    )
+  ) {
+
+    candidates.push(
+      `//${meta.tag}[@title="${meta.title}"]`
+    );
+  }
+
+  if (
+    meta.alt &&
+    isCleanValue(
+      meta.alt,
+      'alt'
+    )
+  ) {
+
+    candidates.push(
+      `//${meta.tag}[@alt="${meta.alt}"]`
+    );
+  }
+
+  if (
+    meta.id &&
+    isCleanValue(
+      meta.id,
+      'id'
+    )
+  ) {
+
+    candidates.push(
+      `//*[@id="${meta.id}"]`
+    );
+  }
+
+  for (const xp of candidates) {
+
+    if (!isStableXpath(xp)) {
+      continue;
+    }
+
+    if (
+      await isUniqueXpath(
+        page,
+        xp
+      )
+    ) {
+
+      return xp;
+    }
+  }
+
+  return undefined;
+}
+async function isUniqueCss(
+  page: Page,
+  selector: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .locator(selector)
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
 
 
+function inferRole(meta: any): string | null {
+
+  /**
+   * USE EXPLICIT ROLE FIRST
+   */
+
+  if (meta.role) {
+    return meta.role;
+  }
+
+  const tag =
+    meta.tag?.toLowerCase();
+
+  const type =
+    meta.type?.toLowerCase();
+
+  switch (tag) {
+
+    /**
+     * BUTTON
+     */
+
+    case 'button':
+      return 'button';
+
+    /**
+     * LINK
+     */
+
+    case 'a':
+      return 'link';
+
+    /**
+     * INPUT TYPES
+     */
+
+    case 'input':
+
+      switch (type) {
+
+        case 'button':
+        case 'submit':
+        case 'reset':
+          return 'button';
+
+        case 'checkbox':
+          return 'checkbox';
+
+        case 'radio':
+          return 'radio';
+
+        case 'email':
+        case 'text':
+        case 'password':
+        case 'search':
+        case 'tel':
+        case 'url':
+        case 'number':
+          return 'textbox';
+
+        case 'range':
+          return 'slider';
+
+        case 'file':
+          return 'button';
+
+        default:
+          return 'textbox';
+      }
+
+    /**
+     * SELECT
+     */
+
+    case 'select':
+      return 'combobox';
+
+    /**
+     * TEXTAREA
+     */
+
+    case 'textarea':
+      return 'textbox';
+
+    /**
+     * IMAGE
+     */
+
+    case 'img':
+      return 'img';
+
+    default:
+      return null;
+  }
+}
+
+function getAccessibleName(
+  meta: any
+): string | null {
+
+  return (
+    meta.label ||
+    meta.placeholder ||
+    meta.alt ||
+    meta.text ||
+    meta.title ||
+    meta.name ||
+    null
+  );
+}
+
+export async function captureElementScreenshot(locator: Locator): Promise<Buffer> {
+  const page = locator.page();
+
+  try {
+    const container = locator.locator(
+      'xpath=ancestor::*[contains(@class,"form") or contains(@class,"field") or contains(@class,"group")][1]'
+    );
+
+    if (await container.first().isVisible().catch(() => false)) {
+      return await container.first().screenshot({ type: 'jpeg', quality: 70 });
+    }
+
+    const id = await locator.getAttribute('id');
+    if (id) {
+      const label = page.locator(`label[for="${id}"]`);
+      if (await label.first().isVisible().catch(() => false)) {
+        const wrapper = label.locator('xpath=ancestor::*[1]');
+        return await wrapper.first().screenshot({ type: 'jpeg', quality: 70 });
+      }
+    }
+
+    const ariaLabelledBy = await locator.getAttribute('aria-labelledby');
+    if (ariaLabelledBy) {
+      const label = page.locator(`#${ariaLabelledBy}`);
+      if (await label.first().isVisible().catch(() => false)) {
+        const wrapper = label.locator('xpath=ancestor::*[1]');
+        return await wrapper.first().screenshot({ type: 'jpeg', quality: 70 });
+      }
+    }
+
+    const ancestor = locator.locator('xpath=ancestor::div[1]');
+    if (await ancestor.first().isVisible().catch(() => false)) {
+      return await ancestor.first().screenshot({ type: 'jpeg', quality: 70 });
+    }
+
+    return await locator.screenshot({ type: 'jpeg', quality: 70 });
+
+  } catch {
+    return await locator.screenshot({ type: 'jpeg', quality: 70 });
+  }
+}
 
 
+export async function captureFullPageScreenshot(page: Page): Promise<Buffer> {
+  return await page.screenshot({
+    fullPage: true,
+    type: 'jpeg',
+    quality: 70, // reduce size
+  });
+}
 
 
+export async function getElementOuterHTML(locator: Locator): Promise<string> {
+  return await locator.evaluate((el) => {
+    const clone = el.cloneNode(true) as HTMLElement;
+
+    // Remove noisy attributes
+    clone.removeAttribute('style');
+
+    [...clone.attributes].forEach(attr => {
+      if (attr.name.startsWith('data-')) {
+        clone.removeAttribute(attr.name);
+      }
+    });
+
+    return clone.outerHTML;
+  });
+}
+
+export async function getMinimalFullDOM(
+  page: Page,
+  maxLength: number = 15000
+): Promise<string> {
+
+  return await page.evaluate((maxLength) => {
+
+    // Clone body to avoid modifying real DOM
+    const clone = document.body.cloneNode(true) as HTMLElement;
+
+    // =========================================
+    // REMOVE NOISE ELEMENTS
+    // =========================================
+
+    clone.querySelectorAll(`
+      script,
+      style,
+      noscript,
+      head,
+      svg,
+      picture,
+      video,
+      img,
+      iframe,
+      canvas,
+      link,
+      meta,
+      source,
+      track,
+      audio
+    `).forEach(el => el.remove());
+
+    // =========================================
+    // REMOVE HIDDEN ELEMENTS
+    // =========================================
+
+    clone.querySelectorAll(`
+      .hidden,
+      [hidden],
+      input[type="hidden"],
+      [aria-hidden="true"]
+    `).forEach(el => el.remove());
+
+    // =========================================
+    // REMOVE COMMENTS
+    // =========================================
+
+    const walker = document.createTreeWalker(
+      clone,
+      NodeFilter.SHOW_COMMENT
+    );
+
+    const comments: Comment[] = [];
+
+    let node;
+
+    while ((node = walker.nextNode())) {
+      comments.push(node as Comment);
+    }
+
+    comments.forEach(comment => {
+      comment.parentNode?.removeChild(comment);
+    });
+
+    // =========================================
+    // REMOVE DYNAMIC / NOISY ATTRIBUTES
+    // =========================================
+
+    const cleanAttributes = (el: Element) => {
+
+      [...el.attributes].forEach(attr => {
+
+        const attrName = attr.name.toLowerCase();
+
+        if (
+          attrName.startsWith('data-') ||
+          attrName === 'style' ||
+          attrName === 'onclick' ||
+          attrName === 'onchange' ||
+          attrName === 'onmouseover' ||
+          attrName === 'onfocus' ||
+          attrName === 'tabindex'
+        ) {
+          el.removeAttribute(attr.name);
+        }
+
+        // Remove dynamic IDs
+        if (
+          attrName === 'id' &&
+          /^[a-zA-Z0-9_-]{20,}$/.test(attr.value)
+        ) {
+          el.removeAttribute('id');
+        }
+
+        // Remove long dynamic classes
+        if (
+          attrName === 'class' &&
+          attr.value.length > 200
+        ) {
+          el.removeAttribute('class');
+        }
+      });
+
+      Array.from(el.children).forEach(child => {
+        cleanAttributes(child);
+      });
+    };
+
+    cleanAttributes(clone);
+
+    // =========================================
+    // NORMALIZE WHITESPACE
+    // =========================================
+
+    let html = clone.innerHTML
+      .replace(/\s+/g, ' ')
+      .replace(/>\s+</g, '><')
+      .trim();
+
+    // =========================================
+    // LIMIT SIZE
+    // =========================================
+
+    if (html.length > maxLength) {
+      html = html.slice(0, maxLength);
+    }
+
+    return html;
+
+  }, maxLength);
+}
 
 
+// export async function getElementContextDOM(
+//   locator: Locator,
+//   parentDepth: number = 5,
+//   siblingCount: number = 2,
+//   descendantDepth: number = 2
+// ): Promise<string> {
 
+//   return await locator.evaluate(
+//     (
+//       el,
+//       { parentDepth, siblingCount, descendantDepth }
+//     ) => {
 
+//       function cleanHTML(node: Element): string {
+//         return node.outerHTML
+//           .replace(/\s+/g, ' ')
+//           .trim();
+//       }
 
+//       function getParents(element: Element, depth: number): string[] {
+//         const parents: string[] = [];
 
+//         let current = element.parentElement;
 
+//         while (current && depth > 0) {
+//           parents.push(cleanHTML(current));
+//           current = current.parentElement;
+//           depth--;
+//         }
 
+//         return parents.reverse();
+//       }
 
+//       function getSiblings(element: Element, count: number): string[] {
 
+//         const siblings: string[] = [];
 
+//         let prev = element.previousElementSibling;
+//         let next = element.nextElementSibling;
 
+//         let added = 0;
 
+//         while (prev && added < count) {
+//           siblings.push(cleanHTML(prev));
+//           prev = prev.previousElementSibling;
+//           added++;
+//         }
 
+//         added = 0;
 
+//         while (next && added < count) {
+//           siblings.push(cleanHTML(next));
+//           next = next.nextElementSibling;
+//           added++;
+//         }
 
+//         return siblings;
+//       }
 
+//       function getDescendants(
+//         element: Element,
+//         depth: number
+//       ): string[] {
 
+//         const results: string[] = [];
 
-const aiResponse = await getAILocator(
-  {
-    elementName,
-    failedLocator: primaryLocator.toString(),
-    smartLocators,
-    oldOuterHTML: element.outer_html,
-    oldDOM: element.full_dom,
-    newDOM: await getMinimalFullDOM(page),
-    currentPageScreenshot,
-    oldPageScreenshot,
-    oldElementScreenshot,
-    meta: element?.meta || {},
-  },
-  page,
-);
+//         function walk(node: Element, currentDepth: number) {
+
+//           if (currentDepth > depth) return;
+
+//           for (const child of Array.from(node.children)) {
+
+//             results.push(cleanHTML(child));
+
+//             walk(child as Element, currentDepth + 1);
+//           }
+//         }
+
+//         walk(element, 1);
+
+//         return results;
+//       }
+
+//       return JSON.stringify({
+//         target: cleanHTML(el),
+//         parents: getParents(el, parentDepth),
+//         siblings: getSiblings(el, siblingCount),
+//         descendants: getDescendants(el, descendantDepth),
+//       });
+//     },
+//     {
+//       parentDepth,
+//       siblingCount,
+//       descendantDepth,
+//     }
+//   );
+// }
+
+export async function getElementContextDOM(
+  locator: Locator,
+  parentDepth: number = 5,
+  siblingCount: number = 2,
+  descendantDepth: number = 2
+): Promise<string> {
+
+  return await locator.evaluate(
+    (
+      el,
+      {
+        parentDepth,
+        siblingCount,
+        descendantDepth
+      }
+    ) => {
+
+      function cleanHTML(
+        node: Element
+      ): string {
+
+        return node.outerHTML
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      function getAncestors(
+        element: Element,
+        depth: number
+      ): string[] {
+
+        const ancestors: string[] = [];
+
+        let current =
+          element.parentElement;
+
+        while (
+          current &&
+          depth > 0
+        ) {
+
+          ancestors.push(
+            cleanHTML(current)
+          );
+
+          current =
+            current.parentElement;
+
+          depth--;
+        }
+
+        return ancestors;
+      }
+
+      function getSiblings(
+        element: Element,
+        count: number
+      ): string[] {
+
+        const siblings: string[] = [];
+
+        let prev =
+          element.previousElementSibling;
+
+        let next =
+          element.nextElementSibling;
+
+        let added = 0;
+
+        while (
+          prev &&
+          added < count
+        ) {
+
+          siblings.push(
+            cleanHTML(prev)
+          );
+
+          prev =
+            prev.previousElementSibling;
+
+          added++;
+        }
+
+        added = 0;
+
+        while (
+          next &&
+          added < count
+        ) {
+
+          siblings.push(
+            cleanHTML(next)
+          );
+
+          next =
+            next.nextElementSibling;
+
+          added++;
+        }
+
+        return siblings;
+      }
+
+      function getDescendants(
+        element: Element,
+        depth: number
+      ): string[] {
+
+        const results: string[] = [];
+
+        function walk(
+          node: Element,
+          currentDepth: number
+        ) {
+
+          if (
+            currentDepth > depth
+          ) {
+            return;
+          }
+
+          for (
+            const child of
+            Array.from(
+              node.children
+            )
+          ) {
+
+            results.push(
+              cleanHTML(child)
+            );
+
+            walk(
+              child as Element,
+              currentDepth + 1
+            );
+          }
+        }
+
+        walk(element, 1);
+
+        return results;
+      }
+
+      const target =
+        cleanHTML(el);
+
+      const ancestors =
+        getAncestors(
+          el,
+          parentDepth
+        );
+
+      const siblings =
+        getSiblings(
+          el,
+          siblingCount
+        );
+
+      const descendants =
+        getDescendants(
+          el,
+          descendantDepth
+        );
+
+      return `
+TARGET:
+${target}
+
+ANCESTORS:
+${ancestors.join('\n')}
+
+SIBLINGS:
+${siblings.join('\n')}
+
+DESCENDANTS:
+${descendants.join('\n')}
+      `.trim();
+    },
+    {
+      parentDepth,
+      siblingCount,
+      descendantDepth
+    }
+  );
+}
