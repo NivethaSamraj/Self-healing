@@ -1,0 +1,1735 @@
+import { test, expect, Page, Locator } from '@playwright/test';
+import * as path from 'path';
+import { pathToFileURL } from 'url';
+import { saveElement, getElement } from '../core/db/elementRepo';
+import { findWithFallback, buildLocator, isValidLocator } from '../core/healing/fallBackEngine';
+import {
+  buildSmartLocatorBundle,
+  captureElementScreenshot,
+  captureFullPageScreenshot,
+  getElementOuterHTML,
+  getMinimalFullDOM,
+} from '../utils/selfHealing';
+
+const htmlPath = path.resolve(__dirname, '..', 'endtoend.html');
+console.log('HTML Path:', htmlPath);
+
+const STORE_URL = pathToFileURL(htmlPath).href;
+const PROMO_CODE = 'SELFHEAL123';
+
+// CAPTURE = bank baseline rows. HEAL = drive actions through DB + fallback engine.
+const MODE = (process.env.MODE ?? 'capture').toLowerCase();
+
+const PACE = { micro: 500, short: 1000, medium: 1800, long: 2600 };
+
+async function settle(page: Page, ms: number = PACE.short): Promise<void> {
+  await page.waitForTimeout(ms);
+}
+
+async function humanScroll(page: Page, pixels: number, steps = 6): Promise<void> {
+  const per = Math.round(pixels / steps);
+  for (let i = 0; i < steps; i++) {
+    await page.mouse.wheel(0, per);
+    await page.waitForTimeout(220);
+  }
+}
+
+/** First visible candidate locator (used only in CAPTURE mode). */
+async function firstVisible(page: Page, candidates: Locator[], timeout = 8000): Promise<Locator> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    for (const c of candidates) {
+      try {
+        if (await c.first().isVisible()) return c.first();
+      } catch { /* try next */ }
+    }
+    await page.waitForTimeout(250);
+  }
+  return candidates[0].first();
+}
+
+/* ===========================================================================
+   CAPTURE: snapshot one element to the DB (writes the baseline you later break)
+   =========================================================================== */
+async function captureElement(
+  page: Page,
+  elementName: string,
+  locator: Locator,
+  primaryLocatorStr: string
+): Promise<void> {
+  try {
+    await locator.first().waitFor({ state: 'visible', timeout: 8000 });
+    const target = locator.first();
+    const bundle = await buildSmartLocatorBundle(target, elementName);
+    const [elementShot, fullPageShot, outerHTML, contextDom] = await Promise.all([
+      captureElementScreenshot(target).catch(() => null),
+      captureFullPageScreenshot(page).catch(() => null),
+      getElementOuterHTML(target).catch(() => ''),
+      getMinimalFullDOM(page).catch(() => ''),
+    ]);
+    await saveElement({
+      elementName,
+      pageUrl: page.url(),
+      primaryLocator: primaryLocatorStr,
+      smartLocators: bundle.smartLocators,
+      meta: bundle.meta,
+      outerHTML,
+      context_dom: contextDom,
+      elementScreenshot: elementShot,
+      fullPageScreenshot: fullPageShot,
+    });
+    console.log(`captured: ${elementName}`);
+  } catch (err: any) {
+    console.warn(`capture failed for ${elementName}: ${err?.message || err}`);
+  }
+}
+
+/* ===========================================================================
+   RESOLVE FROM DB: try DB primary, then DB smart locators (role/css/xpath/...).
+   Returns a usable locator + the strategy that worked, or null if none worked.
+   =========================================================================== */
+async function resolveFromDB(
+  page: Page,
+  elementName: string
+): Promise<{ locator: Locator; strategy: string } | null> {
+  const row = await getElement(elementName);
+  if (!row) {
+    console.warn(`   (no DB row for ${elementName})`);
+    return null;
+  }
+
+  // 1. DB primary
+  if (row.primary_locator) {
+    const primary = buildLocator(page, row.primary_locator);
+    if (primary && (await isValidLocator(primary))) {
+      return { locator: primary, strategy: 'db-primary' };
+    }
+    console.log(`  DB primary failed: ${row.primary_locator}`);
+  }
+
+  // 2. DB smart locators, in priority order
+  const smart =
+    typeof row.smart_locators === 'string'
+      ? JSON.parse(row.smart_locators)
+      : row.smart_locators;
+
+  const priority = ['role', 'testId', 'label', 'placeholder', 'text', 'alt', 'title', 'css', 'xpath'];
+  for (const key of priority) {
+    const locStr = smart?.[key];
+    if (!locStr) continue;
+    const built = buildLocator(page, locStr);
+    if (built && (await isValidLocator(built))) {
+      return { locator: built, strategy: key };
+    }
+    console.log(`  smart [${key}] failed: ${locStr}`);
+  }
+
+  return null; // nothing in the DB worked -> caller should invoke AI fallback
+}
+
+/* ===========================================================================
+   smartAct: the single entry point used in HEAL mode.
+   DB primary -> DB smart locators -> (if all fail) findWithFallback (AI).
+   =========================================================================== */
+async function smartAct(
+  page: Page,
+  elementName: string,
+  action: (loc: Locator) => Promise<void>,
+  label: string
+): Promise<Locator> {
+  console.log(` ${label}`);
+
+  let locator: Locator | null = null;
+  let strategy = '';
+
+  const fromDB = await resolveFromDB(page, elementName);
+  if (fromDB) {
+    locator = fromDB.locator;
+    strategy = fromDB.strategy;
+  } else {
+    // DB primary + all smart locators failed -> AI healing via the engine.
+console.log('');
+console.log('=================================');
+console.log(`AI HEALING INVOKED : ${elementName}`);
+console.log('=================================');    const healed = await findWithFallback(
+      page,
+      elementName,
+      page.locator('body'), // placeholder; engine resolves real locator from DB/AI
+      'novacart-checkout'
+    );
+    locator = healed.locator;
+    strategy = healed.usedStrategy;
+  }
+
+  console.log(`  resolved via [${strategy}]`);
+  await locator.scrollIntoViewIfNeeded();
+  await settle(page, PACE.micro);
+  await action(locator);
+  await settle(page, PACE.short);
+  return locator;
+}
+
+/* ===========================================================================
+   Per-step driver: CAPTURE banks the baseline, HEAL drives through DB/AI.
+   =========================================================================== */
+async function step(
+  page: Page,
+  elementName: string,
+  captureCandidates: Locator[],
+  capturePrimaryStr: string,
+  action: (loc: Locator) => Promise<void>,
+  label: string
+): Promise<void> {
+  if (MODE === 'capture') {
+    const el = await firstVisible(page, captureCandidates);
+    await captureElement(page, elementName, el, capturePrimaryStr);
+    console.log(` ${label}`);
+    await el.scrollIntoViewIfNeeded();
+    await settle(page, PACE.micro);
+    await action(el);
+    await settle(page, PACE.short);
+  } else {
+    await smartAct(page, elementName, action, label);
+  }
+}
+
+const click = (loc: Locator) => loc.click();
+
+test.describe('NovaCart mock store — checkout journey', () => {
+  test.setTimeout(120_000);
+
+  test('Shop, add two products, apply promo, checkout', async ({ page }) => {
+    console.log(`\n### MODE = ${MODE} ###`);
+
+    // 1. Open store
+    console.log('\n=== STEP 1: Open store ===');
+    await page.goto(STORE_URL, { waitUntil: 'domcontentloaded' });
+    await settle(page, PACE.medium);
+    await expect(page).toHaveTitle(/NovaCart/i);
+
+    // 2. Shop Now
+    console.log('\n=== STEP 2: Shop Now ===');
+    await step(page, 'shop_now_button',
+      [page.getByRole('button', { name: /shop now/i }), page.locator('#shop-now')],
+      '#shop-now', click, 'Shop Now (green)');
+
+    // 3. Scroll
+    console.log('\n=== STEP 3: Scroll ===');
+    await humanScroll(page, 700);
+    await settle(page, PACE.medium);
+
+    // 4. Open a product
+    console.log('\n=== STEP 4: Open a product ===');
+    await step(page, 'product_open_link',
+      [page.locator('[data-open-product]'), page.locator('.product-link')],
+      '.product-link', click, 'Open product detail');
+    await expect(page.locator('#product-overlay')).toHaveClass(/open/);
+
+    // 5 & 6. Size + Add to Bag
+    console.log('\n=== STEP 5/6: Size & Add to Bag ===');
+    await step(page, 'size_swatch_first',
+      [page.locator('#m-sizes .size-btn:not([disabled])')],
+      '#m-sizes .size-btn:not([disabled])', click, 'Select first available size');
+    await step(page, 'add_to_bag_button',
+      [page.getByRole('button', { name: /add to bag/i }), page.locator('#add-to-bag')],
+      '#add-to-bag', click, 'Add to Bag (red)');
+    await settle(page, PACE.medium);
+    await expect(page.locator('#cart-count')).toHaveText('1');
+
+    // 7. Continue Shopping
+    console.log('\n=== STEP 7: Continue Shopping ===');
+    await step(page, 'continue_shopping_button',
+      [page.getByRole('button', { name: /continue shopping/i }), page.locator('#continue-shopping')],
+      '#continue-shopping', click, 'Continue Shopping');
+
+    // 8. Clothing -> Tees & Knits
+    console.log('\n=== STEP 8: Clothing > Tees & Knits ===');
+    const clothingMenu = page.locator('[data-menu="clothing"]');
+
+await clothingMenu.hover();
+
+await page.locator('[data-nav="tees-knits"]').click();
+
+    // 9. Sort -> Rating
+    console.log('\n=== STEP 9: Sort by Rating ===');
+    await step(page, 'sort_select',
+      [page.locator('#sort-select'), page.getByRole('combobox', { name: /sort/i }), page.locator('select[name="sort"]')],
+      '#sort-select', (loc) => loc.selectOption('rating'), 'Sort by Rating');
+    await settle(page, PACE.medium);
+
+    // 10. First sorted product
+    console.log('\n=== STEP 10: Open first product ===');
+    await step(page, 'first_sorted_product',
+      [page.locator('#product-grid [data-open-product]').first(), page.locator('.product-link').first()],
+      '#product-grid .product-link', click, 'Open first sorted product');
+    await expect(page.locator('#product-overlay')).toHaveClass(/open/);
+
+    // 11. Size + Add to Bag (2nd)
+    console.log('\n=== STEP 11: Size & Add to Bag (2nd) ===');
+    await step(page, 'size_swatch_first',
+      [page.locator('#m-sizes .size-btn:not([disabled])')],
+      '#m-sizes .size-btn:not([disabled])', click, 'Select first available size');
+    await step(page, 'add_to_bag_button',
+      [page.getByRole('button', { name: /add to bag/i }), page.locator('#add-to-bag')],
+      '#add-to-bag', click, 'Add to Bag (red)');
+    await settle(page, PACE.medium);
+    await expect(page.locator('#cart-count')).toHaveText('2');
+
+    // 12. View Bag & Checkout
+    console.log('\n=== STEP 12: View Bag & Checkout ===');
+    await step(page, 'view_bag_button',
+      [page.getByRole('button', { name: /view bag.*checkout|view bag/i }), page.locator('#view-bag')],
+      '#view-bag', click, 'View Bag & Checkout');
+    await expect(page.locator('#cart-page')).toHaveClass(/active/);
+
+    // 13. Promo code
+    console.log('\n=== STEP 13: Enter promo code ===');
+    await step(page, 'promo_input',
+      [page.getByPlaceholder(/promo/i), page.locator('#promo-input'), page.locator('input[name="promoCode"]')],
+      '#promo-input',
+      async (loc) => { await loc.fill(''); await loc.type(PROMO_CODE, { delay: 110 }); },
+      'Enter promo code');
+    await settle(page, PACE.short);
+
+    // 14. Apply promo
+    console.log('\n=== STEP 14: Apply promo ===');
+    await step(page, 'apply_promo_button',
+      [page.getByRole('button', { name: /^apply$/i }), page.locator('#apply-promo')],
+      '#apply-promo', click, 'Apply promo');
+    await expect(page.locator('#promo-msg')).toBeVisible();
+    console.log('   promo result:', await page.locator('#promo-msg').textContent());
+    await settle(page, PACE.medium);
+
+    // 15. Checkout
+    console.log('\n=== STEP 15: Checkout ===');
+    await step(page, 'checkout_button',
+      [page.getByRole('button', { name: /^checkout$/i }), page.locator('#checkout-btn')],
+      '#checkout-btn', click, 'Checkout');
+
+    await expect(page.locator('#checkout-overlay')).toHaveClass(/open/);
+    await expect(page.locator('#checkout-heading')).toHaveText(/order confirmed/i);
+    console.log('\nReached checkout confirmation. Total:',
+      await page.locator('#checkout-total').textContent());
+
+    await settle(page, PACE.long);
+  });
+});
+
+
+
+
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NovaCart — Mock Store for Test Automation</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --surface: #171a21;
+    --surface-2: #1f232c;
+    --line: #2a2f3a;
+    --text: #e8eaed;
+    --muted: #9aa3b2;
+    --accent: #f0a500;      /* amber CTA, Amazon-ish */
+    --accent-2: #1a8917;    /* green "Shop Now" */
+    --danger: #d83a3a;      /* red add-to-bag */
+    --radius: 14px;
+    --shadow: 0 8px 30px rgba(0,0,0,.45);
+    font-synthesis: none;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 80% -10%, #1b2030 0%, transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial;
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+  a { color: inherit; text-decoration: none; }
+
+  /* ---------- Header / Nav ---------- */
+  header {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(15,17,21,.9);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .nav {
+    max-width: 1200px; margin: 0 auto; padding: 14px 22px;
+    display: flex; align-items: center; gap: 26px;
+  }
+  .logo {
+    font-weight: 800; font-size: 22px; letter-spacing: -.5px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .logo b { color: var(--accent); }
+  .menu { display: flex; gap: 22px; margin-left: 8px; position: relative; }
+  .menu > .menu-item { position: relative; padding: 8px 0; cursor: pointer; color: var(--muted); font-weight: 600; }
+  .menu > .menu-item:hover { color: var(--text); }
+  /* dropdown */
+  .dropdown {
+    position: absolute; top: 100%; left: 0;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 12px; box-shadow: var(--shadow);
+    min-width: 220px; padding: 8px; display: none; flex-direction: column;
+  }
+  .menu-item:hover .dropdown { display: flex; }
+  .dropdown a { padding: 10px 12px; border-radius: 8px; color: var(--muted); }
+  .dropdown a:hover { background: var(--surface-2); color: var(--text); }
+
+  .nav-right { margin-left: auto; display: flex; align-items: center; gap: 18px; }
+  .cart-pill {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--surface-2); border: 1px solid var(--line);
+    padding: 8px 14px; border-radius: 999px; cursor: pointer; font-weight: 600;
+  }
+  .cart-count {
+    background: var(--accent); color: #1a1a1a; font-weight: 800;
+    border-radius: 999px; min-width: 22px; height: 22px;
+    display: grid; place-items: center; font-size: 13px;
+  }
+
+  /* ---------- Hero ---------- */
+  .hero {
+    max-width: 1200px; margin: 30px auto; padding: 0 22px;
+  }
+  .hero-card {
+    border-radius: 20px; overflow: hidden; position: relative;
+    background: linear-gradient(120deg, #20283a, #11151d);
+    border: 1px solid var(--line);
+    padding: 60px 50px; box-shadow: var(--shadow);
+  }
+  .hero-card h1 { font-size: 44px; letter-spacing: -1px; max-width: 620px; }
+  .hero-card p { color: var(--muted); margin-top: 14px; max-width: 520px; font-size: 17px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    border: none; cursor: pointer; font-weight: 700; font-size: 15px;
+    padding: 14px 26px; border-radius: 999px; color: #fff;
+    transition: transform .12s ease, filter .12s ease;
+  }
+  .btn:hover { transform: translateY(-1px); filter: brightness(1.08); }
+  .btn-green { background: var(--accent-2); margin-top: 26px; }
+  .btn-amber { background: var(--accent); color: #1a1a1a; }
+  .btn-red { background: var(--danger); }
+  .btn-ghost { background: var(--surface-2); border: 1px solid var(--line); color: var(--text); }
+
+  /* ---------- Sections ---------- */
+  .section { max-width: 1200px; margin: 40px auto; padding: 0 22px; }
+  .section-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 22px; gap: 16px;
+  }
+  .section-head h2 { font-size: 26px; letter-spacing: -.5px; }
+  .sort-wrap { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+  select.sort-select {
+    background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 14px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+
+  /* ---------- Product Grid ---------- */
+  .grid {
+    display: grid; gap: 22px;
+    grid-template-columns: repeat(4, 1fr);
+  }
+  @media (max-width: 980px){ .grid{ grid-template-columns: repeat(2,1fr);} }
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); overflow: hidden;
+    display: flex; flex-direction: column; transition: transform .15s ease, border-color .15s ease;
+  }
+  .card:hover { transform: translateY(-4px); border-color: #3a4150; }
+  .card .thumb { aspect-ratio: 4/3; width: 100%; display: block; background: #0c0e13; }
+  .card .body { padding: 16px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .card .name { font-weight: 700; font-size: 16px; }
+  .card .cat { color: var(--muted); font-size: 13px; }
+  .stars { color: var(--accent); font-size: 14px; letter-spacing: 1px; }
+  .price-row { display: flex; align-items: center; justify-content: space-between; margin-top: auto; }
+  .price { font-size: 19px; font-weight: 800; }
+  .product-link {
+    margin-top: 6px; font-size: 14px; font-weight: 700; color: var(--accent);
+    cursor: pointer; align-self: flex-start;
+  }
+
+  /* ---------- Product Modal ---------- */
+  .overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px;
+  }
+  .overlay.open { display: flex; }
+  .modal {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 18px; max-width: 760px; width: 100%;
+    box-shadow: var(--shadow); overflow: hidden;
+    display: grid; grid-template-columns: 1fr 1fr;
+  }
+  @media (max-width: 720px){ .modal{ grid-template-columns: 1fr; } }
+  .modal .m-img { background: #0c0e13; }
+  .modal .m-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .modal .m-body { padding: 26px; display: flex; flex-direction: column; gap: 14px; }
+  .modal h3 { font-size: 24px; letter-spacing: -.5px; }
+  .modal .m-price { font-size: 24px; font-weight: 800; color: var(--text); }
+  .size-label { font-size: 13px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+  .sizes { display: flex; gap: 10px; flex-wrap: wrap; }
+  .size-btn {
+    min-width: 50px; padding: 10px 0; text-align: center;
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: 10px; cursor: pointer; font-weight: 700; color: var(--text);
+  }
+  .size-btn:hover { border-color: var(--accent); }
+  .size-btn.selected { background: var(--accent); color: #1a1a1a; border-color: var(--accent); }
+  .size-btn[disabled] { opacity: .35; cursor: not-allowed; text-decoration: line-through; }
+  .modal-actions { display: flex; gap: 12px; margin-top: 8px; }
+  .close-x {
+    position: absolute; top: 14px; right: 16px; font-size: 26px;
+    cursor: pointer; color: var(--muted); background: none; border: none;
+  }
+  .modal-wrap { position: relative; }
+
+  /* ---------- Mini-cart confirm ---------- */
+  .toast {
+    position: fixed; top: 80px; right: 24px; z-index: 200;
+    background: var(--surface); border: 1px solid var(--accent-2);
+    border-radius: 12px; padding: 16px 18px; box-shadow: var(--shadow);
+    display: none; flex-direction: column; gap: 12px; max-width: 320px;
+  }
+  .toast.show { display: flex; }
+  .toast .t-actions { display: flex; gap: 10px; }
+  .toast .t-actions .btn { padding: 10px 16px; font-size: 13px; }
+
+  /* ---------- Cart Page ---------- */
+  .cart-page { display: none; }
+  .cart-page.active { display: block; }
+  .store-page.hidden { display: none; }
+  .cart-layout { display: grid; grid-template-columns: 1fr 360px; gap: 26px; }
+  @media (max-width: 900px){ .cart-layout{ grid-template-columns: 1fr; } }
+  .cart-items { display: flex; flex-direction: column; gap: 14px; }
+  .cart-item {
+    display: flex; gap: 16px; align-items: center;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 14px;
+  }
+  .cart-item img { width: 90px; height: 70px; object-fit: cover; border-radius: 10px; background:#0c0e13; }
+  .cart-item .ci-info { flex: 1; }
+  .cart-item .ci-info .ci-name { font-weight: 700; }
+  .cart-item .ci-info .ci-meta { color: var(--muted); font-size: 13px; }
+  .summary {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 22px; height: fit-content;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .summary h3 { font-size: 20px; }
+  .sum-row { display: flex; justify-content: space-between; color: var(--muted); }
+  .sum-row.total { color: var(--text); font-weight: 800; font-size: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .promo-row { display: flex; gap: 8px; }
+  .promo-row input {
+    flex: 1; background: var(--surface-2); border: 1px solid var(--line);
+    color: var(--text); border-radius: 10px; padding: 11px 12px; font-size: 14px;
+  }
+  .promo-msg { font-size: 13px; min-height: 18px; }
+  .promo-msg.err { color: var(--danger); }
+  .promo-msg.ok { color: var(--accent-2); }
+  .empty-cart { color: var(--muted); padding: 30px 0; }
+  footer { text-align: center; color: var(--muted); padding: 40px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<!-- ====================== HEADER ====================== -->
+<header>
+  <div class="nav">
+    <div class="logo">Nova<b>Cart</b></div>
+    <nav class="menu">
+      <div class="menu-item" data-menu="clothing">
+        Clothing ▾
+        <div class="dropdown" data-dropdown="clothing">
+          <a data-nav="tees-knits" data-category="Tees &amp; Knits">Tees &amp; Knits</a>
+          <a data-nav="dresses" data-category="Dresses">Dresses</a>
+          <a data-nav="outerwear" data-category="Outerwear">Outerwear</a>
+          <a data-nav="denim" data-category="Denim">Denim</a>
+        </div>
+      </div>
+      <div class="menu-item" data-menu="shoes">
+        Shoes ▾
+        <div class="dropdown" data-dropdown="shoes">
+          <a data-nav="sneakers" data-category="Sneakers">Sneakers</a>
+          <a data-nav="boots" data-category="Boots">Boots</a>
+        </div>
+      </div>
+      <div class="menu-item" data-menu="home">Home</div>
+    </nav>
+    <div class="nav-right">
+      <div class="cart-pill" id="open-cart">
+        🛒 Bag <span class="cart-count" id="cart-count">0</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ====================== STORE PAGE ====================== -->
+<main class="store-page" id="store-page">
+  <!-- Hero -->
+  <section class="hero">
+    <div class="hero-card">
+      <h1>Discover the new season. Quality you can feel.</h1>
+      <p>A mock storefront purpose-built for end-to-end test automation. Every flow is stable, deterministic, and yours to break.</p>
+      <button class="btn btn-green" id="shop-now">Shop Now →</button>
+    </div>
+  </section>
+
+  <!-- Product grid -->
+  <section class="section" id="catalog">
+    <div class="section-head">
+      <h2 id="catalog-title">Featured Picks</h2>
+      <div class="sort-wrap">
+        <span>Sort by</span>
+        <select class="sort-select" id="sort-select" name="sort">
+          <option value="featured">Featured</option>
+          <option value="price-low">Price: Low to High</option>
+          <option value="price-high">Price: High to Low</option>
+          <option value="newest">Newest</option>
+          <option value="rating">Rating</option>
+        </select>
+      </div>
+    </div>
+    <div class="grid" id="product-grid"><!-- products injected --></div>
+  </section>
+</main>
+
+<!-- ====================== CART PAGE ====================== -->
+<main class="cart-page section" id="cart-page">
+  <div class="section-head"><h2>Your Bag</h2></div>
+  <div class="cart-layout">
+    <div class="cart-items" id="cart-items"></div>
+    <aside class="summary">
+      <h3>Order Summary</h3>
+      <div class="sum-row"><span>Subtotal</span><span id="sum-subtotal">$0.00</span></div>
+      <div class="sum-row" id="discount-row" style="display:none"><span>Discount</span><span id="sum-discount">-$0.00</span></div>
+      <div class="sum-row"><span>Shipping</span><span>$5.00</span></div>
+      <div class="promo-row">
+        <input type="text" id="promo-input" name="promoCode" placeholder="Promo code" />
+        <button class="btn btn-ghost" id="apply-promo">Apply</button>
+      </div>
+      <div class="promo-msg" id="promo-msg"></div>
+      <div class="sum-row total"><span>Total</span><span id="sum-total">$0.00</span></div>
+      <button class="btn btn-amber" id="checkout-btn" style="justify-content:center">Checkout</button>
+      <button class="btn btn-ghost" id="back-to-store" style="justify-content:center">← Continue Shopping</button>
+    </aside>
+  </div>
+</main>
+
+<!-- ====================== PRODUCT MODAL ====================== -->
+<div class="overlay" id="product-overlay">
+  <div class="modal-wrap">
+    <button class="close-x" id="modal-close">×</button>
+    <div class="modal">
+      <div class="m-img"><img id="m-img" alt="product" /></div>
+      <div class="m-body">
+        <span class="cat" id="m-cat"></span>
+        <h3 id="m-name"></h3>
+        <div class="stars" id="m-stars"></div>
+        <div class="m-price" id="m-price"></div>
+        <div>
+          <div class="size-label">Select size</div>
+          <div class="sizes" id="m-sizes"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-red" id="add-to-bag">Add to Bag</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ====================== ADDED-TO-BAG TOAST ====================== -->
+<div class="toast" id="cart-toast">
+  <div><strong>✓ Added to your bag</strong></div>
+  <div class="t-actions">
+    <button class="btn btn-amber" id="view-bag">View Bag &amp; Checkout</button>
+    <button class="btn btn-ghost" id="continue-shopping">Continue Shopping</button>
+  </div>
+</div>
+
+<!-- ====================== CHECKOUT CONFIRM ====================== -->
+<div class="overlay" id="checkout-overlay">
+  <div class="modal-wrap">
+    <div class="modal" style="grid-template-columns:1fr; max-width:480px; text-align:center;">
+      <div class="m-body" style="align-items:center;">
+        <h3 id="checkout-heading">🎉 Order Confirmed</h3>
+        <p style="color:var(--muted)">This is the mock checkout success page. Order total:
+          <strong id="checkout-total" style="color:var(--text)"></strong>
+        </p>
+        <button class="btn btn-green" id="checkout-done" style="justify-content:center">Done</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer>NovaCart — a deterministic mock store for Playwright / self-healing automation. No real transactions.</footer>
+
+<script>
+function svgThumb(label, c1, c2) {
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='400' height='300'>
+    <defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>
+      <stop offset='0' stop-color='${c1}'/><stop offset='1' stop-color='${c2}'/>
+    </linearGradient></defs>
+    <rect width='400' height='300' fill='url(#g)'/>
+    <text x='50%' y='50%' fill='rgba(255,255,255,.92)' font-family='sans-serif'
+      font-size='26' font-weight='700' text-anchor='middle' dominant-baseline='middle'>${label}</text>
+  </svg>`;
+  return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+}
+
+const SIZES = ['XS','S','M','L','XL'];
+
+const PRODUCTS = [
+  { id:1, name:'Merino Crew Tee',      category:'Tees & Knits', price:48,  rating:4.8, newness:3, img:svgThumb('Merino Crew Tee','#3b6ea5','#15314f'), soldOut:['XS'] },
+  { id:2, name:'Ribbed Knit Top',      category:'Tees & Knits', price:62,  rating:4.5, newness:5, img:svgThumb('Ribbed Knit Top','#a55b3b','#4f2415'), soldOut:[] },
+  { id:3, name:'Linen Henley',         category:'Tees & Knits', price:54,  rating:4.9, newness:1, img:svgThumb('Linen Henley','#5b8c5a','#244f2b'), soldOut:['XL'] },
+  { id:4, name:'Boxy Pocket Tee',      category:'Tees & Knits', price:39,  rating:4.2, newness:2, img:svgThumb('Boxy Pocket Tee','#8c5a8c','#3a153a'), soldOut:[] },
+  { id:5, name:'Wrap Midi Dress',      category:'Dresses',      price:128, rating:4.7, newness:4, img:svgThumb('Wrap Midi Dress','#a53b5b','#4f1530'), soldOut:[] },
+  { id:6, name:'Tiered Maxi Dress',    category:'Dresses',      price:148, rating:4.4, newness:6, img:svgThumb('Tiered Maxi Dress','#3b8ca5','#15414f'), soldOut:['S'] },
+  { id:7, name:'Quilted Field Jacket', category:'Outerwear',    price:198, rating:4.6, newness:2, img:svgThumb('Field Jacket','#7a6f3b','#3a3415'), soldOut:[] },
+  { id:8, name:'Wool Topcoat',         category:'Outerwear',    price:268, rating:4.9, newness:1, img:svgThumb('Wool Topcoat','#5a5a6e','#24243a'), soldOut:[] },
+  { id:9, name:'High-Rise Straight Jean', category:'Denim',     price:98,  rating:4.3, newness:3, img:svgThumb('Straight Jean','#3b5aa5','#15244f'), soldOut:[] },
+  { id:10, name:'Canvas Low Sneaker',  category:'Sneakers',     price:78,  rating:4.1, newness:4, img:svgThumb('Low Sneaker','#5aa58c','#154f3a'), soldOut:[] },
+  { id:11, name:'Chelsea Boot',        category:'Boots',        price:158, rating:4.8, newness:2, img:svgThumb('Chelsea Boot','#6e4f3b','#3a2415'), soldOut:[] },
+  { id:12, name:'Cashmere Beanie',     category:'Tees & Knits', price:45,  rating:4.0, newness:5, img:svgThumb('Cashmere Beanie','#a5933b','#4f4115'), soldOut:[] },
+];
+
+/* ============================================================
+   State
+   ============================================================ */
+let cart = [];
+let currentCategory = null;        // null = featured (all)
+let currentSort = 'featured';
+let activeProduct = null;
+let selectedSize = null;
+let appliedDiscount = 0;
+
+const VALID_PROMOS = { 'SAVE10': 0.10, 'NOVA20': 0.20 };
+
+/* ============================================================
+   Rendering
+   ============================================================ */
+const grid = document.getElementById('product-grid');
+
+function starString(r){
+  const full = Math.round(r);
+  return '★'.repeat(full) + '☆'.repeat(5-full) + '  ' + r.toFixed(1);
+}
+
+function getVisibleProducts(){
+  let list = PRODUCTS.slice();
+  if (currentCategory) list = list.filter(p => p.category === currentCategory);
+  switch(currentSort){
+    case 'price-low':  list.sort((a,b)=>a.price-b.price); break;
+    case 'price-high': list.sort((a,b)=>b.price-a.price); break;
+    case 'newest':     list.sort((a,b)=>a.newness-b.newness); break;
+    case 'rating':     list.sort((a,b)=>b.rating-a.rating); break;
+    default: break; // featured = original order
+  }
+  return list;
+}
+
+function renderGrid(){
+  const list = getVisibleProducts();
+  grid.innerHTML = '';
+  list.forEach(p=>{
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.dataset.productId = p.id;
+    card.dataset.productName = p.name;
+    card.innerHTML = `
+      <img class="thumb" src="${p.img}" alt="${p.name}" />
+      <div class="body">
+        <div class="cat">${p.category}</div>
+        <div class="name">${p.name}</div>
+        <div class="stars">${starString(p.rating)}</div>
+        <div class="price-row">
+          <div class="price">$${p.price.toFixed(2)}</div>
+        </div>
+        <span class="product-link" data-open-product="${p.id}">View Product →</span>
+      </div>`;
+    grid.appendChild(card);
+  });
+}
+
+/* ============================================================
+   Product modal
+   ============================================================ */
+function openProduct(id){
+  activeProduct = PRODUCTS.find(p=>p.id===id);
+  selectedSize = null;
+  document.getElementById('m-img').src = activeProduct.img;
+  document.getElementById('m-cat').textContent = activeProduct.category;
+  document.getElementById('m-name').textContent = activeProduct.name;
+  document.getElementById('m-stars').textContent = starString(activeProduct.rating);
+  document.getElementById('m-price').textContent = '$' + activeProduct.price.toFixed(2);
+
+  const sizesWrap = document.getElementById('m-sizes');
+  sizesWrap.innerHTML = '';
+  SIZES.forEach(sz=>{
+    const b = document.createElement('button');
+    b.className = 'size-btn';
+    b.textContent = sz;
+    b.dataset.size = sz;
+    if (activeProduct.soldOut.includes(sz)) b.disabled = true;
+    b.addEventListener('click', ()=>{
+      if (b.disabled) return;
+      selectedSize = sz;
+      sizesWrap.querySelectorAll('.size-btn').forEach(x=>x.classList.remove('selected'));
+      b.classList.add('selected');
+    });
+    sizesWrap.appendChild(b);
+  });
+
+  document.getElementById('product-overlay').classList.add('open');
+}
+
+function closeProduct(){
+  document.getElementById('product-overlay').classList.remove('open');
+}
+
+/* ============================================================
+   Cart
+   ============================================================ */
+function addToCart(){
+  if (!selectedSize){
+    // surface a clear, testable validation state
+    alert('Please select a size first.');
+    return;
+  }
+  cart.push({ ...activeProduct, size: selectedSize });
+  document.getElementById('cart-count').textContent = cart.length;
+  closeProduct();
+  showToast();
+}
+
+function showToast(){
+  const t = document.getElementById('cart-toast');
+  t.classList.add('show');
+}
+function hideToast(){
+  document.getElementById('cart-toast').classList.remove('show');
+}
+
+function renderCart(){
+  const wrap = document.getElementById('cart-items');
+  wrap.innerHTML = '';
+  if (cart.length === 0){
+    wrap.innerHTML = '<div class="empty-cart">Your bag is empty.</div>';
+  } else {
+    cart.forEach((item, idx)=>{
+      const el = document.createElement('div');
+      el.className = 'cart-item';
+      el.dataset.cartIndex = idx;
+      el.innerHTML = `
+        <img src="${item.img}" alt="${item.name}" />
+        <div class="ci-info">
+          <div class="ci-name">${item.name}</div>
+          <div class="ci-meta">Size: ${item.size} · ${item.category}</div>
+        </div>
+        <div class="price">$${item.price.toFixed(2)}</div>`;
+      wrap.appendChild(el);
+    });
+  }
+  updateSummary();
+}
+
+function updateSummary(){
+  const subtotal = cart.reduce((s,i)=>s+i.price, 0);
+  const shipping = cart.length ? 5 : 0;
+  const discountAmt = subtotal * appliedDiscount;
+  const total = subtotal - discountAmt + shipping;
+
+  document.getElementById('sum-subtotal').textContent = '$' + subtotal.toFixed(2);
+  document.getElementById('sum-total').textContent = '$' + total.toFixed(2);
+
+  const dRow = document.getElementById('discount-row');
+  if (appliedDiscount > 0){
+    dRow.style.display = 'flex';
+    document.getElementById('sum-discount').textContent = '-$' + discountAmt.toFixed(2);
+  } else {
+    dRow.style.display = 'none';
+  }
+}
+
+/* ============================================================
+   Navigation between store / cart pages
+   ============================================================ */
+function showCart(){
+  hideToast();
+  renderCart();
+  document.getElementById('store-page').classList.add('hidden');
+  document.getElementById('cart-page').classList.add('active');
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+function showStore(){
+  document.getElementById('cart-page').classList.remove('active');
+  document.getElementById('store-page').classList.remove('hidden');
+}
+
+/* ============================================================
+   Event wiring
+   ============================================================ */
+// Shop now -> scroll to catalog
+document.getElementById('shop-now').addEventListener('click', ()=>{
+  document.getElementById('catalog').scrollIntoView({behavior:'smooth'});
+});
+
+// Delegated: open product
+document.addEventListener('click', (e)=>{
+  const opener = e.target.closest('[data-open-product]');
+  if (opener){ openProduct(parseInt(opener.dataset.openProduct,10)); }
+});
+
+document.getElementById('modal-close').addEventListener('click', closeProduct);
+document.getElementById('product-overlay').addEventListener('click', (e)=>{
+  if (e.target.id === 'product-overlay') closeProduct();
+});
+
+document.getElementById('add-to-bag').addEventListener('click', addToCart);
+
+// Toast actions
+document.getElementById('continue-shopping').addEventListener('click', hideToast);
+document.getElementById('view-bag').addEventListener('click', showCart);
+
+// Cart pill -> cart page
+document.getElementById('open-cart').addEventListener('click', showCart);
+document.getElementById('back-to-store').addEventListener('click', showStore);
+
+// Category nav (dropdown links)
+document.querySelectorAll('[data-nav]').forEach(link=>{
+  link.addEventListener('click', ()=>{
+    currentCategory = link.dataset.category;
+    document.getElementById('catalog-title').textContent = currentCategory;
+    showStore();
+    renderGrid();
+    document.getElementById('catalog').scrollIntoView({behavior:'smooth'});
+  });
+});
+
+// Sort
+document.getElementById('sort-select').addEventListener('change', (e)=>{
+  currentSort = e.target.value;
+  renderGrid();
+});
+
+// Promo
+document.getElementById('apply-promo').addEventListener('click', ()=>{
+  const code = document.getElementById('promo-input').value.trim().toUpperCase();
+  const msg = document.getElementById('promo-msg');
+  if (VALID_PROMOS[code]){
+    appliedDiscount = VALID_PROMOS[code];
+    msg.textContent = `Code applied: ${Math.round(appliedDiscount*100)}% off`;
+    msg.className = 'promo-msg ok';
+  } else {
+    appliedDiscount = 0;
+    msg.textContent = 'Invalid or expired promo code.';
+    msg.className = 'promo-msg err';
+  }
+  updateSummary();
+});
+
+// Checkout
+document.getElementById('checkout-btn').addEventListener('click', ()=>{
+  if (cart.length === 0){ alert('Your bag is empty.'); return; }
+  document.getElementById('checkout-total').textContent =
+    document.getElementById('sum-total').textContent;
+  document.getElementById('checkout-overlay').classList.add('open');
+});
+document.getElementById('checkout-done').addEventListener('click', ()=>{
+  document.getElementById('checkout-overlay').classList.remove('open');
+});
+
+/* ============================================================
+   Init
+   ============================================================ */
+renderGrid();
+</script>
+</body>
+</html>
+
+
+
+
+import OpenAI from 'openai';
+import * as dotenv from 'dotenv';
+dotenv.config();
+
+const client = new OpenAI({
+  apiKey: "9RHwcaOLWs773i7s8W1VIO6IrgIbsRuWP4Uh32Dx4lYCjPnleGlBJQQJ99BEACHYHv6XJ3w3AAABACOGgGw3",
+  baseURL: "https://testingsl1.openai.azure.com/openai/deployments/gpt-4.1",
+  defaultQuery: {
+    "api-version": "2024-02-15-preview",
+  },
+  defaultHeaders: {
+    "api-key": "9RHwcaOLWs773i7s8W1VIO6IrgIbsRuWP4Uh32Dx4lYCjPnleGlBJQQJ99BEACHYHv6XJ3w3AAABACOGgGw3",
+  },
+});
+
+type AIResponse = {
+  locator: string;
+  confidence: number;
+  reason: string;
+};
+
+
+export async function getAILocator(data: any): Promise<AIResponse> {
+
+  const prompt = `
+You are a Playwright locator expert.
+
+Goal:
+Generate a UNIQUE, STABLE, and RELIABLE locator for the target element.
+
+========================
+CONTEXT
+========================
+
+Element Name:
+${data.elementName}
+
+Failed Locator:
+${data.failedLocator}
+
+Previous Smart Locators:
+${JSON.stringify(data.smartLocators)}
+
+Element Metadata:
+${JSON.stringify(data.meta)}
+
+------------------------
+OLD ELEMENT SNAPSHOT
+------------------------
+${data.oldOuterHTML}
+
+------------------------
+OLD PAGE DOM
+------------------------
+${data.oldDOM}
+
+------------------------
+CURRENT PAGE DOM
+------------------------
+${data.newDOM}
+
+------------------------
+VISUAL CONTEXT
+------------------------
+
+OLD ELEMENT SCREENSHOT (base64):
+${data.oldElementScreenshot || 'Not available'}
+
+OLD FULL PAGE SCREENSHOT (base64):
+${data.oldPageScreenshot || 'Not available'}
+
+CURRENT FULL PAGE SCREENSHOT (base64):
+${data.currentPageScreenshot || 'Not available'}
+
+========================
+INSTRUCTIONS
+========================
+
+Before returning a locator:
+
+1. Verify the locator exists in CURRENT DOM.
+
+2. Verify it matches exactly one element.
+
+3. Do not use an attribute from OLD DOM
+unless that same attribute appears in CURRENT DOM.
+
+Step 1:
+Locate the element in the OLD PAGE DOM using the OLD ELEMENT SNAPSHOT.
+
+Step 2:
+Use OLD ELEMENT SCREENSHOT to understand exact visual identity.
+
+Step 3:
+Use OLD FULL PAGE SCREENSHOT to understand layout and position.
+
+Step 4:
+Compare with CURRENT FULL PAGE SCREENSHOT and CURRENT DOM.
+
+Step 5:
+Find the MOST SIMILAR element in CURRENT PAGE DOM.
+
+Step 6:
+Identify changes:
+- id
+- class
+- text
+- structure
+- position
+
+Step 7:
+Generate the BEST locator.
+
+========================
+RULES (STRICT)
+========================
+
+- Locator MUST match EXACTLY ONE element
+- Prefer in order:
+  1. getByRole(role, { name })
+  2. getByLabel()
+  3. getByPlaceholder()
+  4. getByText() (exact match)
+- Use CSS selector if needed
+- Avoid XPath unless absolutely necessary
+- Avoid dynamic attributes
+- Use exact matching wherever possible
+
+
+Before returning a locator:
+
+1. Verify the locator exists in CURRENT DOM.
+
+2. Verify it matches exactly one element.
+
+3. Do not use an attribute from OLD DOM
+unless that same attribute appears in CURRENT DOM.
+
+========================
+OUTPUT FORMAT (STRICT JSON ONLY)
+========================
+
+{
+  "locator": "...",
+  "confidence": 0-1,
+  "reason": "Why this locator uniquely identifies the element based on OLD vs NEW comparison"
+}
+
+CRITICAL:
+
+Never return a locator based solely on OLD DOM.
+
+The locator MUST be derivable from CURRENT DOM.
+
+Before suggesting a locator:
+
+1. Verify it exists in CURRENT DOM.
+2. Verify it uniquely identifies one element.
+3. Prefer CURRENT attributes over OLD attributes.
+4. Use OLD DOM only to understand intent.
+
+IMPORTANT:
+
+The CURRENT DOM is the source of truth.
+
+Never assume an attribute exists.
+
+Only use attributes that literally appear
+inside CURRENT PAGE DOM.
+
+If a locator would match zero elements,
+do not return it.
+
+If the original element cannot be confidently
+mapped to a current element, return:
+
+{
+  "locator":"NO_MATCH",
+  "confidence":0,
+  "reason":"No equivalent element found"
+}
+`;
+
+  const response = await client.chat.completions.create({
+    model: process.env.AZURE_OPENAI_DEPLOYMENT!,
+    messages: [
+      { role: 'system', content: 'You generate Playwright locators' },
+      { role: 'user', content: prompt },
+    ],
+    temperature: 0.2,
+  });
+
+  const text = response.choices[0].message.content || '';
+
+  const cleaned = text
+    .replace(/```json/g, '')
+    .replace(/```/g, '')
+    .trim();
+
+  try {
+
+    return JSON.parse(cleaned);
+  } catch {
+    throw new Error('Invalid AI response');
+  }
+}
+
+
+fallback :
+
+import { Page, Locator } from '@playwright/test';
+import { getElement } from '../db/elementRepo';
+import { getAILocator } from '../ai/aiHealing';
+import { saveHealingLog } from '../db/healingRepo';
+import { getMinimalFullDOM } from '../../utils/selfHealing';
+import { HealingLogger } from '../../utils/healingLogger';
+import { containsDynamicId } from '../../utils/selfHealing';
+
+//  TYPE FIRST
+type FallbackResult = {
+  locator: Locator;
+  usedStrategy: string;
+};
+
+export async function findWithFallback(
+  page: Page,
+  elementName: string,
+  primaryLocator: Locator,
+  testName: string = 'default-test'
+): Promise<FallbackResult> {
+
+  const attempted: string[] = [];
+
+  // =========================================================
+  // START LOGGING
+  // =========================================================
+
+  HealingLogger.info('Test', testName);
+  HealingLogger.info('Element', elementName);
+  HealingLogger.info('Page', page.url());
+
+  HealingLogger.info('AI SELF-HEALING STARTED', 'Azure_OpenAI');
+
+  // =========================================================
+  // STEP 1 — FETCH ELEMENT FROM DB
+  // =========================================================
+
+  HealingLogger.subSection(
+    'STEP 1 — DATABASE PRIMARY LOCATOR'
+  );
+
+  const element = await getElement(elementName);
+
+  if (!element) {
+
+    HealingLogger.fail(
+      `No locator data found for ${elementName}`
+    );
+
+    throw new Error(
+      `No locator data found for ${elementName}`
+    );
+  }
+
+  const dbPrimaryLocatorStr = element.primary_locator;
+
+  if (dbPrimaryLocatorStr) {
+
+    HealingLogger.info(
+      'Trying',
+      dbPrimaryLocatorStr
+    );
+
+    const dbPrimary = buildLocator(
+      page,
+      dbPrimaryLocatorStr
+    );
+
+    if (
+      dbPrimary &&
+      await isValidLocator(dbPrimary)
+    ) {
+
+      HealingLogger.success(
+        `DB Primary locator worked`
+      );
+
+      await saveHealingLog({
+        elementName,
+        testName,
+        failedLocator: 'POM_PRIMARY',
+        attemptedLocators: attempted,
+        healedLocator: dbPrimaryLocatorStr,
+        strategy: 'db-primary',
+        status: 'HEALED',
+        errorMessage: null,
+      });
+
+      return {
+        locator: dbPrimary,
+        usedStrategy: 'db-primary',
+      };
+    }
+
+    attempted.push('db-primary');
+
+    HealingLogger.fail(
+      `DB Primary locator failed`
+    );
+  }
+
+  // =========================================================
+  // STEP 2 — SMART LOCATOR FALLBACK
+  // =========================================================
+
+  HealingLogger.subSection(
+    'STEP 2 — SMART LOCATOR FALLBACK'
+  );
+
+  const smartLocators =
+    typeof element.smart_locators === 'string'
+      ? JSON.parse(element.smart_locators)
+      : element.smart_locators;
+
+  const priority = [
+    'role',
+    'testId',
+    'label',
+    'placeholder',
+    'text',
+    'alt',
+    'title',
+    'css',
+    'xpath'
+  ];
+
+  for (const key of priority) {
+
+    const locatorStr = smartLocators?.[key];
+
+    if (!locatorStr) continue;
+
+    attempted.push(key);
+
+    HealingLogger.info(
+      'Strategy',
+      key
+    );
+
+    HealingLogger.info(
+      'Locator',
+      locatorStr
+    );
+
+    const built = buildLocator(
+      page,
+      locatorStr
+    );
+
+    if (!built) {
+
+      HealingLogger.fail(
+        'Failed to build locator'
+      );
+
+      continue;
+    }
+
+    const valid = await isValidLocator(built);
+
+    HealingLogger.info(
+      'Result',
+      valid ? 'SUCCESS' : 'FAILED'
+    );
+
+    if (valid) {
+
+      HealingLogger.success(
+        `Element healed using ${key}`
+      );
+
+      await saveHealingLog({
+        elementName,
+        testName,
+        failedLocator: primaryLocator,
+        attemptedLocators: attempted,
+        healedLocator: locatorStr,
+        strategy: key,
+        status: 'HEALED',
+        errorMessage: null,
+      });
+
+      HealingLogger.section(
+        'HEALING COMPLETED'
+      );
+
+      return {
+        locator: built,
+        usedStrategy: key,
+      };
+    }
+  }
+
+  // =========================================================
+  // STEP 3 — AI HEALING
+  // =========================================================
+
+  HealingLogger.subSection(
+    'STEP 3 — AI HEALING'
+  );
+
+  HealingLogger.ai(
+    'Collecting screenshots and DOM context'
+  );
+
+  try {
+
+    // =========================================================
+    // CURRENT SCREENSHOT
+    // =========================================================
+
+    const screenshotBuffer =
+      await page.screenshot({
+        fullPage: true
+      });
+
+    const currentPageScreenshot =
+      screenshotBuffer.toString('base64');
+
+    // =========================================================
+    // OLD ELEMENT SCREENSHOT
+    // =========================================================
+
+    const oldElementScreenshot =
+      element?.element_screenshot
+        ? Buffer
+          .from(element.element_screenshot)
+          .toString('base64')
+        : null;
+
+    // =========================================================
+    // OLD FULL PAGE SCREENSHOT
+    // =========================================================
+
+    const oldPageScreenshot =
+      element?.full_page_screenshot
+        ? Buffer
+          .from(element.full_page_screenshot)
+          .toString('base64')
+        : null;
+
+    // =========================================================
+    // OLD OUTER HTML
+    // =========================================================
+
+    const oldOuterHTML =
+      element?.outer_html || '';
+
+    if (!oldOuterHTML) {
+
+      HealingLogger.warn(
+        'No stored outerHTML found'
+      );
+    }
+
+    HealingLogger.ai(
+      'Sending healing request to AI model'
+    );
+
+    // =========================================================
+    // AI CALL
+    // =========================================================
+
+    const aiResponse = await getAILocator({
+      elementName,
+      failedLocator: primaryLocator.toString(),
+      smartLocators,
+      oldOuterHTML: element.outer_html,
+      oldDOM: element.context_dom,
+      newDOM: await getMinimalFullDOM(page),
+      currentPageScreenshot,
+      oldPageScreenshot,
+      oldElementScreenshot,
+      meta: element?.meta || {},
+    });
+
+    // =========================================================
+    // AI RESPONSE LOGGING
+    // =========================================================
+
+    HealingLogger.ai(
+      `Locator      : ${aiResponse?.locator}`
+    );
+
+    HealingLogger.ai(
+      `Confidence   : ${aiResponse?.confidence}`
+    );
+
+    HealingLogger.ai(
+      `Reason       : ${aiResponse?.reason}`
+    );
+
+    // =========================================================
+    // VALIDATE AI RESPONSE
+    // =========================================================
+
+    if (
+      !aiResponse ||
+      !aiResponse.locator
+    ) {
+
+      throw new Error(
+        'AI returned empty or invalid response'
+      );
+    }
+
+    // =========================================================
+    // CONFIDENCE CHECK
+    // =========================================================
+
+    if (aiResponse.confidence < 0.7) {
+
+      throw new Error(
+        `Low confidence AI response: ${aiResponse.confidence}`
+      );
+    }
+
+    // =========================================================
+    // BUILD AI LOCATOR
+    // =========================================================
+
+    if (
+      containsDynamicId(
+        aiResponse.locator
+      )
+    ) {
+
+      throw new Error(
+        'AI returned dynamic locator'
+      );
+    }
+
+    const aiLocator = buildLocator(
+      page,
+      aiResponse.locator
+    );
+
+    if (!aiLocator) {
+
+      throw new Error(
+        'Failed to build locator from AI response'
+      );
+    }
+
+    // =========================================================
+    // VALIDATE AI LOCATOR
+    // =========================================================
+
+    const isValid =
+      await isValidLocator(aiLocator);
+
+    if (isValid) {
+
+      HealingLogger.subSection(
+        'HEALING SUCCESS'
+      );
+
+      HealingLogger.success(
+        'AI locator validated successfully'
+      );
+
+      HealingLogger.info(
+        'Final Locator',
+        aiResponse.locator
+      );
+
+      HealingLogger.info(
+        'Confidence',
+        aiResponse.confidence
+      );
+
+      await saveHealingLog({
+        elementName,
+        testName,
+        failedLocator: primaryLocator.toString(),
+        attemptedLocators: attempted,
+        healedLocator: aiResponse.locator,
+        strategy: 'AI',
+        status: 'AI_HEALED',
+        errorMessage: null,
+      });
+
+      HealingLogger.section(
+        'HEALING COMPLETED'
+      );
+
+      return {
+        locator: aiLocator,
+        usedStrategy: 'AI',
+      };
+    }
+
+    throw new Error(
+      'AI locator is not valid on current page'
+    );
+
+  } catch (error: any) {
+
+    HealingLogger.subSection(
+      'HEALING FAILED'
+    );
+
+    HealingLogger.fail(
+      error?.message || 'Unknown healing error'
+    );
+
+    await saveHealingLog({
+      elementName,
+      testName,
+      failedLocator: primaryLocator.toString(),
+      attemptedLocators: attempted,
+      healedLocator: null,
+      strategy: 'AI',
+      status: 'FAILED',
+      errorMessage: error?.message || 'Unknown error',
+    });
+
+    throw new Error(
+      `All locator strategies including AI failed for ${elementName}`
+    );
+  }
+}
+
+export function buildLocator(page: Page, locatorStr: string): Locator | null {
+  try {
+    // getByRole
+
+    if (locatorStr.startsWith('getByRole')) {
+
+
+     const roleMatch = locatorStr.match(
+  /getByRole\(\s*['"](.*?)['"]\s*,\s*\{[\s\S]*?name\s*:\s*['"](.*?)['"]/
+);
+
+      if (roleMatch) {
+
+        const role = roleMatch[1]?.trim();
+
+        const name = roleMatch[2]?.trim();
+
+        return page.getByRole(
+          role as any,
+          {
+            name,
+            exact: true,
+          }
+        );
+      }
+
+      console.warn(
+        `Failed to parse getByRole locator: ${locatorStr}`
+      );
+    }
+
+    if (
+      locatorStr.startsWith(
+        'getByTestId'
+      )
+    ) {
+
+      const val =
+        locatorStr.match(
+          /getByTestId\(\s*['"](.*?)['"]/
+        )?.[1];
+
+      if (val) {
+
+        return page.getByTestId(
+          val
+        );
+      }
+    }
+
+    // getByText
+    if (locatorStr.startsWith('getByText')) {
+      const text = locatorStr.match(/getByText\(\s*['"](.*?)['"]/)?.[1];
+      if (text) return page.getByText(text, { exact: true });
+    }
+
+    // getByPlaceholder
+    if (locatorStr.startsWith('getByPlaceholder')) {
+      const val = locatorStr.match(/getByPlaceholder\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByPlaceholder(new RegExp(`^${escapeRegex(val)}$`));
+      }
+    }
+
+    // getByLabel
+    if (locatorStr.startsWith('getByLabel')) {
+      const val = locatorStr.match(/getByLabel\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByLabel(val, { exact: true });
+      }
+    }
+
+    // getByAltText
+    if (locatorStr.startsWith('getByAltText')) {
+      const val = locatorStr.match(/getByAltText\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByAltText(val, { exact: true });
+      }
+    }
+
+    // getByTitle
+    if (locatorStr.startsWith('getByTitle')) {
+      const val = locatorStr.match(/getByTitle\(\s*['"](.*?)['"]/)?.[1];
+      if (val) {
+        return page.getByTitle(val, { exact: true });
+      }
+    }
+
+    // CSS / XPath fallback
+    return page.locator(locatorStr);
+
+  } catch {
+    return null;
+  }
+}
+
+// Validate locator safely
+export async function isValidLocator(
+  locator: Locator
+): Promise<boolean> {
+  try {
+
+    const count = await locator.count();
+
+    if (count === 0) {
+      HealingLogger.warn(
+        'Locator matched 0 elements'
+      );
+      return false;
+    }
+
+    if (count > 1) {
+      HealingLogger.warn(
+        `Locator matched ${count} elements`
+      );
+      return false;
+    }
+
+    await locator.waitFor({
+      state: 'visible',
+      timeout: 3000,
+    });
+
+    return true;
+
+  } catch (error: any) {
+
+    HealingLogger.warn(
+      `Locator validation failed: ${error.message}`
+    );
+
+    return false;
+  }
+}
+function escapeRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+
