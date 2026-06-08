@@ -1,0 +1,438 @@
+import { test, expect, Page, Locator } from '@playwright/test';
+import { saveElement, getElement } from '../core/db/elementRepo';
+import { findWithFallback, buildLocator, isValidLocator } from '../core/healing/fallBackEngine';
+import {
+    buildSmartLocatorBundle,
+    captureElementScreenshot,
+    captureFullPageScreenshot,
+    getElementOuterHTML,
+    getMinimalFullDOM,
+} from '../utils/selfHealing';
+
+const MODE = (process.env.MODE ?? 'capture').toLowerCase();
+
+const PACE = {
+    micro: 500,
+    short: 1000,
+    medium: 1500
+};
+
+async function settle(page: Page, ms = PACE.short) {
+    await page.waitForTimeout(ms);
+}
+
+async function firstVisible(
+    page: Page,
+    candidates: Locator[],
+    timeout = 8000
+): Promise<Locator> {
+
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+
+        for (const c of candidates) {
+            try {
+
+                if (await c.first().isVisible()) {
+                    return c.first();
+                }
+
+            } catch { }
+        }
+
+        await page.waitForTimeout(250);
+    }
+
+    return candidates[0].first();
+}
+
+async function captureElement(
+    page: Page,
+    elementName: string,
+    locator: Locator,
+    primaryLocatorStr: string
+) {
+
+    try {
+
+        await locator.waitFor({
+            state: 'visible',
+            timeout: 8000
+        });
+
+        const bundle =
+            await buildSmartLocatorBundle(
+                locator,
+                elementName
+            );
+
+        const [
+            elementShot,
+            fullPageShot,
+            outerHTML,
+            contextDom
+        ] = await Promise.all([
+            captureElementScreenshot(locator).catch(() => null),
+            captureFullPageScreenshot(page).catch(() => null),
+            getElementOuterHTML(locator).catch(() => ''),
+            getMinimalFullDOM(page).catch(() => '')
+        ]);
+
+        await saveElement({
+            elementName,
+            pageUrl: page.url(),
+            primaryLocator: primaryLocatorStr,
+            smartLocators: bundle.smartLocators,
+            meta: bundle.meta,
+            outerHTML,
+            context_dom: contextDom,
+            elementScreenshot: elementShot,
+            fullPageScreenshot: fullPageShot
+        });
+
+        console.log(`captured: ${elementName}`);
+
+    } catch (err: any) {
+
+        console.log(
+            `capture failed: ${elementName}`
+        );
+    }
+}
+
+async function resolveFromDB(
+    page: Page,
+    elementName: string
+) {
+
+    const row =
+        await getElement(elementName);
+
+    if (!row) return null;
+
+    if (row.primary_locator) {
+
+        const primary =
+            buildLocator(
+                page,
+                row.primary_locator
+            );
+
+        if (
+            primary &&
+            await isValidLocator(primary)
+        ) {
+            return {
+                locator: primary,
+                strategy: 'db-primary'
+            };
+        }
+    }
+
+
+    const smart =
+        typeof row.smart_locators === 'string'
+            ? JSON.parse(row.smart_locators)
+            : row.smart_locators;
+
+    console.log(
+        'SMART LOCATORS:',
+        JSON.stringify(smart, null, 2)
+    );
+
+    const priority = [
+        'role',
+        'testId',
+        'label',
+        'placeholder',
+        'text',
+        'alt',
+        'title',
+        'css',
+        'xpath'
+    ];
+
+    for (const key of priority) {
+
+        const locStr = smart?.[key];
+
+        if (!locStr) continue;
+
+        const built =
+            buildLocator(page, locStr);
+
+        if (built) {
+
+            const valid =
+                await isValidLocator(built);
+
+            console.log(
+                `[Smart Locator] ${key} = ${locStr}`
+            );
+
+            console.log(
+                `[Valid] ${valid}`
+            );
+
+            if (valid) {
+
+                console.log(
+                    `[Smart Locator Success] ${key}`
+                );
+
+                return {
+                    locator: built,
+                    strategy: key
+                };
+            }
+        }
+    }
+
+    return null;
+
+}
+
+async function smartAct(
+    page: Page,
+    elementName: string,
+    action: (loc: Locator) => Promise<void>,
+    label: string
+) {
+
+    console.log(label);
+
+    let locator: Locator;
+
+    const resolved =
+        await resolveFromDB(
+            page,
+            elementName
+        );
+
+    if (resolved) {
+
+        locator = resolved.locator;
+
+    } else {
+
+        const healed =
+            await findWithFallback(
+                page,
+                elementName,
+                page.locator('body'),
+                'ann-taylor page'
+            );
+
+        locator = healed.locator;
+    }
+
+    await locator.scrollIntoViewIfNeeded();
+
+    if (
+        !(await isValidLocator(locator))
+    ) {
+
+        throw new Error(
+            `Locator invalid for ${elementName}`
+        );
+    }
+
+    await action(locator);
+
+    return locator;
+}
+
+async function step(
+    page: Page,
+    elementName: string,
+    captureCandidates: Locator[],
+    primaryLocator: string,
+    action: (loc: Locator) => Promise<void>,
+    label: string
+) {
+
+    if (MODE === 'capture') {
+
+        const el =
+            await firstVisible(
+                page,
+                captureCandidates
+            );
+
+        await captureElement(
+            page,
+            elementName,
+            el,
+            primaryLocator
+        );
+
+        await action(el);
+
+    } else {
+
+        await smartAct(
+            page,
+            elementName,
+            action,
+            label
+        );
+    }
+}
+
+test.describe(
+    'Ann taylor Homepage',
+    () => {
+
+        test(
+            'homepage interactions',
+            async ({ page }) => {
+
+                await page.goto(
+                    'https://sfqa.anntaylor.com/',
+                    {
+                        waitUntil: 'domcontentloaded'
+                    }
+                );
+
+                await page.waitForTimeout(5000);
+
+                await step(
+                    page,
+                    'continue_shopping',
+                    [
+                        page.locator('#continueButton'),
+                        page.locator('.cookie-content #continueButton'),
+                        page.getByRole('button', {
+                            name: /continue shopping/i
+                        })
+                    ],
+                    '#continueButton',
+                    async loc => {
+
+                        await loc.click();
+
+                        await page.waitForTimeout(3000);
+
+                    },
+                    'Continue Shopping'
+                );
+
+                //
+                // Scroll homepage
+                //
+                await page.mouse.wheel(0, 800);
+
+                await page.waitForTimeout(2000);
+
+                //
+                // Shades Of The Season
+                //
+                await step(
+                    page,
+                    'shades_of_the_season',
+                    [
+                        page.getByRole('link', {
+                            name: /shades of the season/i
+                        }),
+                        page.getByText(/shades of the season/i)
+                    ],
+                    'shades of the season',
+                    async loc => {
+
+                        await loc.click();
+
+                        await page.waitForLoadState('domcontentloaded');
+
+                        await page.waitForTimeout(3000);
+
+                    },
+                    'Open Shades Of The Season'
+                );
+
+                //
+                // Scroll PLP
+                //
+                await page.mouse.wheel(0, 1200);
+
+                await page.waitForTimeout(2000);
+
+                //
+                // First Dress
+                //
+                await step(
+                    page,
+                    'dress_product',
+                    [
+                        page.locator('[data-testid*="product"]').first(),
+                        page.locator('.product-tile a').first(),
+                        page.locator('a[href*="/p/"]').first()
+                    ],
+                    'first dress',
+                    async loc => {
+
+                        await loc.click();
+
+                        await page.waitForLoadState('domcontentloaded');
+
+                        await page.waitForTimeout(3000);
+
+                    },
+                    'Open Dress Product'
+                );
+
+                //
+                // Size Selection
+                //
+
+
+                await step(
+                    page,
+                    'dress_size',
+                    [
+                        page.getByRole('button', { name: /^XS\/S$/i, disabled: false }),
+                        page.getByRole('button', { name: /^M$/i, disabled: false }),
+                        page.getByRole('button', { name: /^L$/i, disabled: false })
+                    ],
+                    'dress size',
+                    async loc => {
+
+                        await loc.click();
+
+                        await page.waitForTimeout(1500);
+
+                    },
+                    'Select Dress Size'
+                );
+
+                //
+                // Add To Bag
+                //
+                await step(
+                    page,
+                    'add_to_bag',
+                    [
+                        page.getByRole('button', {
+                            name: /add to bag/i
+                        }),
+                        page.getByText(/add to bag/i)
+                    ],
+                    'add to bag',
+                    async loc => {
+
+                        await loc.click();
+
+                        await page.waitForTimeout(3000);
+                    },
+                    'Add To Bag'
+                );
+                await expect(
+                    page.locator('body')
+                ).toContainText(
+                    /bag|cart|added/i
+                );
+
+            }
+        );
+    }
+);
