@@ -10,229 +10,495 @@ POM broken → heals, test passes, but nothing written to DB (the inverse of the
 
 
 
-/**
- * modelA.syncFromPOM.spec.ts
- *
- * Verifies model A: the Page Object is the source of truth.
- *
- * syncFromPOM (in BrowserActionImpl) runs on the SUCCESS path (POM locator
- * worked, no fallback). Its three branches:
- *   1. element NOT in DB              -> full capture (saveElement)
- *   2. stored primary == POM locator  -> nothing written
- *   3. stored primary != POM locator  -> updateElementFromPOM (POM locator
- *                                        + regenerated smart bundle)
- *
- * And the inverse of the old behavior:
- *   4. POM locator BROKEN -> heals (test still passes) but writes NOTHING.
- *
- * Plain Playwright Test (no jest). The DB layer is monkeypatched so no live
- * Postgres is needed and so we can observe exactly what was written.
- *
- * PATHS: adjust imports + FIXTURE to your repo.
- */
+import { Page, Locator, expect } from '@playwright/test';
+import { BrowserAction } from './BrowserAction';
+import { buildSmartLocatorBundle, captureFullPageScreenshot, getElementContextDOM, getElementOuterHTML, getMinimalFullDOM } from '../utils/selfHealing';
+import { captureElementScreenshot } from '../utils/selfHealing';
+import { getElement, saveElement, updateElementFromPOM } from '../core/db/elementRepo';
+import { findWithFallback } from '../core/healing/fallbackEngine';
 
-import { test, expect, Page, Locator } from '@playwright/test';
-import path from 'path';
+export default class BrowserActionImpl implements BrowserAction {
 
-import BrowserActionImpl from '../src/core/actions/BrowserActionImpl';  // adjust
-import * as elementRepo from '../src/core/db/elementRepo';
-import * as healingRepo from '../src/core/db/healingRepo';
 
-// locator-lab.html has a Login button: role=button, name "Login", text "Login".
-const FIXTURE =
-  'file://' + path.resolve(__dirname, '../locator-lab.html');
+  private locatorMap = new WeakMap<Locator, string>();
 
-// ---------------------------------------------------------------------------
-// Observable in-memory DB. We record saveElement and updateElementFromPOM
-// calls, and control what getElement returns per test.
-// ---------------------------------------------------------------------------
-type Row = {
-  element_name: string;
-  primary_locator: string;
-  smart_locators: any;
-  meta: any;
-};
+  protected registerPageLocators(pageObject: any) {
 
-let savedCalls: Row[] = [];
-let updateCalls: { name: string; primary: string; smart: any; meta: any }[] = [];
-let getReturn: ((name: string) => any) | null = null;
+    const pageName = pageObject.constructor.name;
 
-let origSave: any, origGet: any, origUpdate: any, origLog: any;
+    for (const key of Object.keys(pageObject)) {
 
-test.beforeEach(() => {
-  savedCalls = [];
-  updateCalls = [];
-  getReturn = () => null;
+      const value = pageObject[key];
 
-  origSave = (elementRepo as any).saveElement;
-  origGet = (elementRepo as any).getElement;
-  origUpdate = (elementRepo as any).updateElementFromPOM;
-  origLog = (healingRepo as any).saveHealingLog;
+      if (
+        value &&
+        typeof value === 'object' &&
+        typeof value.fill === 'function'
+      ) {
 
-  (healingRepo as any).saveHealingLog = async () => {};
+        this.locatorMap.set(
+          value,
+          `${pageName}_${key}`
+        );
+      }
+    }
+  }
 
-  (elementRepo as any).saveElement = async (data: any) => {
-    const row: Row = {
-      element_name: data.elementName,
-      primary_locator: data.primaryLocator,
-      smart_locators: data.smartLocators ?? {},
-      meta: data.meta ?? {},
+  protected getElementName(locator: Locator): string {
+
+    return (
+      this.locatorMap.get(locator) ??
+      'Unknown_Element'
+    );
+  }
+
+  // ===========================================================================
+  // CENTRAL POST-ACTION PERSISTENCE
+  //
+  // Called after EVERY action, whether or not fallback was used.
+  //   - element NOT in DB                    -> capture it (first sight),
+  //                                             using whatever locator worked
+  //                                             (POM locator if no fallback,
+  //                                             healed locator if fallback).
+  //   - element in DB, POM worked, primary != POM -> sync DB to the POM locator
+  //   - element in DB, POM worked, primary == POM -> nothing
+  //   - element in DB, fallback used         -> nothing written (model A:
+  //                                             never persist a healed locator
+  //                                             over an existing row).
+  //
+  // The crucial fix vs. before: a FRESH element is now captured even when it
+  // had to heal on first sight. Previously capture was gated behind
+  // `if (!usedFallback)`, so any element that healed on run 1 was never stored
+  // and healed forever.
+  // ===========================================================================
+  private async persistAfterAction(
+    workingLocator: Locator,
+    elementName: string,
+    usedFallback: boolean
+  ): Promise<void> {
+
+    if (elementName === 'Unknown_Element') {
+      // Not a registered POM locator; nothing to key a row on.
+      return;
+    }
+
+    const existing = await getElement(elementName);
+
+    // ---- FIRST SIGHT: capture regardless of how we located it -------------
+    if (!existing) {
+      const pomPrimary = workingLocator.toString();
+      await this.captureAndStore(workingLocator, elementName, pomPrimary);
+      return;
+    }
+
+    // ---- ALREADY STORED ---------------------------------------------------
+    if (usedFallback) {
+      // model A: healed locators are never persisted over an existing row.
+      return;
+    }
+
+    // POM locator worked. Compare to stored primary.
+    const pomPrimary = workingLocator.toString();
+
+    if (existing.primary_locator === pomPrimary) {
+      return; // unchanged -> leave it
+    }
+
+    // POM differs from stored -> POM is the source of truth.
+    const bundle = await buildSmartLocatorBundle(workingLocator, elementName);
+    await updateElementFromPOM(
+      elementName,
+      pomPrimary,
+      bundle.smartLocators,
+      bundle.meta
+    );
+  }
+
+  async click(
+    locator: Locator,
+    waitForPageRefresh: boolean = false
+  ): Promise<void> {
+
+    const page = locator.page();
+    const elementName = this.getElementName(locator);
+
+    let finalLocator = locator;
+    let usedFallback = false;
+
+    try {
+      await this.waitForReady(locator);
+      await locator.click();
+    } catch (err) {
+      console.log(`[TRY FAILED] ${elementName} -> ${(err as Error)?.message?.split('\n')[0]}`);
+      const result = await findWithFallback(page, elementName, locator);
+      finalLocator = result.locator;
+      usedFallback = true;
+      await finalLocator.click();
+    }
+
+    await this.persistAfterAction(finalLocator, elementName, usedFallback);
+
+    if (waitForPageRefresh) {
+      await this.waitForPageRefresh(page, elementName);
+      await page.waitForLoadState('networkidle');
+    }
+  }
+
+  async selectDropdownByVisibleText(
+    locator: Locator,
+    optionValue: string,
+    waitForPageRefresh: boolean = false
+  ): Promise<void> {
+
+    const page = locator.page();
+    const elementName = this.getElementName(locator);
+
+    let finalLocator = locator;
+    let usedFallback = false;
+
+    try {
+      await this.waitForReady(locator);
+      await locator.selectOption({ label: optionValue });
+      await locator.press('Tab');
+    } catch (err) {
+      console.log(`[TRY FAILED] ${elementName} -> ${(err as Error)?.message?.split('\n')[0]}`);
+      const result = await findWithFallback(page, elementName, locator);
+      finalLocator = result.locator;
+      usedFallback = true;
+      await finalLocator.selectOption({ label: optionValue });
+      await finalLocator.press('Tab');
+    }
+
+    await this.persistAfterAction(finalLocator, elementName, usedFallback);
+
+    if (waitForPageRefresh) {
+      await this.waitForPageRefresh(page, elementName);
+      await page.waitForLoadState('networkidle');
+    }
+  }
+
+  async selectDropdownByIndex(
+    locator: Locator,
+    index: number,
+    waitForPageRefresh: boolean = false
+  ): Promise<void> {
+
+    const page = locator.page();
+    const elementName = this.getElementName(locator);
+
+    let finalLocator = locator;
+    let usedFallback = false;
+
+    try {
+      await this.waitForReady(locator);
+      await locator.selectOption({ index });
+    } catch (err) {
+      console.log(`[TRY FAILED] ${elementName} -> ${(err as Error)?.message?.split('\n')[0]}`);
+      const result = await findWithFallback(page, elementName, locator);
+      finalLocator = result.locator;
+      usedFallback = true;
+      await this.waitForReady(finalLocator);
+      await finalLocator.selectOption({ index });
+    }
+
+    await this.persistAfterAction(finalLocator, elementName, usedFallback);
+
+    if (waitForPageRefresh) {
+      await this.waitForPageRefresh(page, elementName);
+      await page.waitForLoadState('networkidle');
+    }
+  }
+
+  async selectDropdownByRandomIndex(
+    locator: Locator
+  ): Promise<void> {
+    await this.selectDropdownByIndex(locator, -1);
+  }
+
+  async selectDropdownByValue(
+    locator: Locator,
+    value: string,
+    waitForPageRefresh: boolean = false
+  ): Promise<void> {
+
+    const page = locator.page();
+    const elementName = this.getElementName(locator);
+
+    let finalLocator = locator;
+    let usedFallback = false;
+
+    try {
+      await this.waitForReady(locator);
+      await locator.selectOption(value);
+    } catch (err) {
+      console.log(`[TRY FAILED] ${elementName} -> ${(err as Error)?.message?.split('\n')[0]}`);
+      const result = await findWithFallback(page, elementName, locator);
+      finalLocator = result.locator;
+      usedFallback = true;
+      await finalLocator.selectOption(value);
+    }
+
+    await this.persistAfterAction(finalLocator, elementName, usedFallback);
+
+    if (waitForPageRefresh) {
+      await this.waitForPageRefresh(page, elementName);
+      await page.waitForLoadState('networkidle');
+    }
+  }
+
+
+
+  async waitForElement(locator: Locator): Promise<void> {
+    await expect(locator.first()).toBeVisible();
+  }
+
+  async scrollIntoView(locator: Locator): Promise<void> {
+    await locator.first().scrollIntoViewIfNeeded();
+  }
+
+  async type(
+    locator: Locator,
+    text: string,
+    waitForPageRefresh: boolean = false
+  ): Promise<void> {
+
+    const page = locator.page();
+    const elementName = this.getElementName(locator);
+
+    let finalLocator = locator;
+    let usedFallback = false;
+
+    try {
+      await this.waitForReady(locator);
+      await locator.fill('');
+      await locator.fill(text);
+    } catch (err) {
+      console.log(`[TRY FAILED] ${elementName} -> ${(err as Error)?.message?.split('\n')[0]}`);
+      const result = await findWithFallback(page, elementName, locator);
+      finalLocator = result.locator;
+      usedFallback = result.usedStrategy !== 'primary';
+      await finalLocator.fill('');
+      await finalLocator.fill(text);
+    }
+
+    await this.persistAfterAction(finalLocator, elementName, usedFallback);
+
+    if (waitForPageRefresh) {
+      await finalLocator.press('Tab');
+      await this.waitForPageRefresh(page, elementName);
+      await page.waitForLoadState('networkidle');
+    }
+  }
+
+  async getText(locator: Locator): Promise<string> {
+    return await locator.first().innerText();
+  }
+
+  async confirmAlert(page: Page): Promise<void> {
+    page.once('dialog', async (dialog) => await dialog.accept());
+  }
+
+  async waitForDisappearance(locator: Locator): Promise<void> {
+    await expect(locator).toBeHidden();
+  }
+
+  async waitForPageRefresh(page: Page, elementDescription: string): Promise<void> {
+    await this.waitForDisappearance(page.locator("div[class*='disable-click']"));
+  }
+
+  async moveToElement(locator: Locator): Promise<void> {
+    await locator.hover();
+  }
+
+  async isEnabled(locator: Locator): Promise<boolean> {
+    return (await locator.isVisible()) && (await locator.isEnabled());
+  }
+
+  async isDisabled(locator: Locator): Promise<boolean> {
+    return await locator.isDisabled();
+  }
+
+  async verifyElementTextIsDisplayed(
+    locator: Locator,
+    expectedText: string
+  ): Promise<void> {
+    const actual = await locator.first().innerText();
+    if (actual !== expectedText) {
+      throw new Error(`Expected: ${expectedText}, Actual: ${actual}`);
+    }
+  }
+
+  async verifyPartialText(
+    locator: Locator,
+    expectedText: string
+  ): Promise<boolean> {
+    const actual = await locator.textContent();
+    return actual?.includes(expectedText) ?? false;
+  }
+
+  async getInputText(locator: Locator): Promise<string> {
+    return await locator.inputValue();
+  }
+
+  async verifyInputText(
+    locator: Locator,
+    expectedText: string
+  ): Promise<boolean> {
+    const actual = await locator.inputValue();
+    return actual.includes(expectedText);
+  }
+
+  async getAttribute(
+    locator: Locator,
+    attribute: string
+  ): Promise<string | null> {
+    return await locator.getAttribute(attribute);
+  }
+
+  async verifyAttribute(
+    locator: Locator,
+    attribute: string,
+    expectedText: string
+  ): Promise<boolean> {
+    const actual = await locator.getAttribute(attribute);
+    if (actual?.includes(expectedText)) return true;
+    throw new Error(`Expected attribute ${expectedText} not matching`);
+  }
+
+  async verifyNotDisplayed(locator: Locator): Promise<boolean> {
+    return !(await locator.isVisible());
+  }
+
+  async isElementDisplaying(locator: Locator): Promise<boolean> {
+    await locator.first().waitFor({ state: 'visible' });
+    return true;
+  }
+
+  async getListOfElements(locator: Locator): Promise<Locator[]> {
+    await locator.first().waitFor({ state: 'visible' });
+    return locator.all();
+  }
+
+  async confirmAlertWithText(
+    page: Page,
+    expectedAlertMessage: string
+  ): Promise<void> {
+    page.once('dialog', async (dialog) => {
+      if (dialog.message() === expectedAlertMessage) {
+        await dialog.accept();
+      } else {
+        throw new Error("Alert message mismatch");
+      }
+    });
+  }
+
+  async evaluate(page: Page, expression: any): Promise<void> {
+    await page.evaluate(expression);
+  }
+
+  async scrollToTopOfThePage(page: Page): Promise<void> {
+    await this.evaluate(page, () => window.scrollTo(0, 0));
+  }
+
+  async uploadFile(locator: Locator, value: string): Promise<void> {
+    await locator.setInputFiles(value);
+  }
+
+  async check(locator: Locator): Promise<boolean> {
+    await locator.check();
+    return true;
+  }
+
+  async pause(page: Page, type: string): Promise<void> {
+    const map: Record<string, number> = {
+      deepinferior: 500,
+      low: 1000,
+      medium: 2000,
+      high: 3000
     };
-    savedCalls.push(row);
-    return row;
-  };
+    await page.waitForTimeout(map[type.toLowerCase()] || 500);
+  }
 
-  (elementRepo as any).getElement = async (name: string) => {
-    return getReturn ? getReturn(name) : null;
-  };
+  async getListOfElementsSize(
+    locator: Locator,
+    timeout: number
+  ): Promise<number> {
+    try {
+      await locator.first().waitFor({ state: 'visible', timeout });
+      return await locator.count();
+    } catch {
+      return 0;
+    }
+  }
 
-  (elementRepo as any).updateElementFromPOM = async (
-    name: string, primary: string, smart: any, meta: any
-  ) => {
-    updateCalls.push({ name, primary, smart, meta });
-    return { element_name: name, primary_locator: primary };
-  };
-});
+  async clear(
+    locator: Locator,
+    elementDescription: string,
+    waitForPageRefresh: boolean = false
+  ): Promise<void> {
+    await locator.fill("");
+    if (waitForPageRefresh) {
+      await locator.press("Tab");
+      await this.waitForPageRefresh(locator.page(), elementDescription);
+      await locator.page().waitForLoadState('networkidle');
+    }
+  }
 
-test.afterEach(() => {
-  (elementRepo as any).saveElement = origSave;
-  (elementRepo as any).getElement = origGet;
-  (elementRepo as any).updateElementFromPOM = origUpdate;
-  (healingRepo as any).saveHealingLog = origLog;
-});
+  async getLambdaTestLink(page: Page): Promise<string> {
+    if (process.env.RUN_ON_LAMBDA !== 'true') return '';
+    try {
+      const response = await page.evaluate(() =>
+        (globalThis as any).lt?.getTestDetails?.() ?? null
+      );
+      const parsed = typeof response === 'string' ? JSON.parse(response) : response;
+      return parsed?.data?.public_url || '';
+    } catch {
+      return '';
+    }
+  }
 
-// ---------------------------------------------------------------------------
-// Minimal POM + action shim. The element must be registered so it gets a name
-// (LoginPage_loginBtn). The POM locator is the live page locator the action
-// will try first.
-// ---------------------------------------------------------------------------
-class LoginPage {
-  readonly loginBtn: Locator;
-  constructor(page: Page) {
-    // primary (POM) locator — this is what gets compared against the DB
-    this.loginBtn = page.getByRole('button', { name: 'Login', exact: true });
+  private async waitForReady(
+    locator: Locator,
+    timeout: number = 5000
+  ): Promise<void> {
+    await locator.waitFor({ state: 'visible', timeout });
+    await expect(locator).toBeEnabled();
+  }
+
+  private async captureAndStore(
+    locator: Locator,
+    elementName: string,
+    primaryLocator: string
+  ) {
+    const page = locator.page();
+
+    const bundle = await buildSmartLocatorBundle(locator, elementName);
+
+    const [elementScreenshot, fullPageScreenshot] = await Promise.all([
+      captureElementScreenshot(locator),
+      captureFullPageScreenshot(page)
+    ]);
+
+    const outerHTML = await getElementOuterHTML(locator);
+    const context_dom = await getElementContextDOM(locator);
+
+    await saveElement({
+      elementName: bundle.elementName,
+      pageUrl: page.url(),
+      primaryLocator: primaryLocator,
+      smartLocators: bundle.smartLocators,
+      meta: bundle.meta,
+      elementScreenshot,
+      fullPageScreenshot,
+      outerHTML,
+      context_dom,
+    });
+  }
+
+  private async elementExistsInDB(
+    elementName: string
+  ): Promise<boolean> {
+    const existing = await getElement(elementName);
+    return existing !== null;
   }
 }
-
-class TestableAction extends (BrowserActionImpl as any) {
-  registerForTest(pom: any) {
-    // @ts-ignore registerPageLocators is protected
-    this.registerPageLocators(pom);
-  }
-}
-
-// The element_name the framework assigns = `${pageName}_${key}` = LoginPage_loginBtn
-const NAME = 'LoginPage_loginBtn';
-// What getByRole(...).toString() yields is the POM "primary" string the action
-// compares. We capture it at runtime rather than hardcoding Playwright's format.
-
-// =============================================================================
-// STEP 1 — element not in DB -> full capture
-// =============================================================================
-test('POM works, not in DB -> captures (saveElement called)', async ({ page }) => {
-  await page.goto(FIXTURE);
-
-  getReturn = () => null;          // nothing stored yet
-
-  const action = new TestableAction();
-  const pom = new LoginPage(page);
-  action.registerForTest(pom);
-
-  await action.click(pom.loginBtn);
-
-  // first-capture path
-  expect(savedCalls.length).toBe(1);
-  expect(savedCalls[0].element_name).toBe(NAME);
-  // no POM-update on a first capture
-  expect(updateCalls.length).toBe(0);
-});
-
-// =============================================================================
-// STEP 2 — stored primary == POM locator -> nothing written
-// =============================================================================
-test('POM works, stored primary matches -> no write', async ({ page }) => {
-  await page.goto(FIXTURE);
-
-  const pom = new LoginPage(page);
-  const pomPrimary = pom.loginBtn.toString();   // exact stored form
-
-  getReturn = () => ({
-    element_name: NAME,
-    primary_locator: pomPrimary,                // identical -> leave it
-    smart_locators: {},
-    meta: {},
-  });
-
-  const action = new TestableAction();
-  action.registerForTest(pom);
-
-  await action.click(pom.loginBtn);
-
-  expect(savedCalls.length).toBe(0);    // not a first capture
-  expect(updateCalls.length).toBe(0);   // matches -> no update
-});
-
-// =============================================================================
-// STEP 3 — stored primary != POM locator -> updateElementFromPOM
-// =============================================================================
-test('POM works, stored primary differs -> updates DB from POM + regenerates bundle', async ({ page }) => {
-  await page.goto(FIXTURE);
-
-  const pom = new LoginPage(page);
-  const pomPrimary = pom.loginBtn.toString();
-
-  getReturn = () => ({
-    element_name: NAME,
-    // a DIFFERENT stored primary (as if the POM selector was changed)
-    primary_locator: "getByRole('button', { name: 'OLD_NAME', exact: true })",
-    smart_locators: {},
-    meta: {},
-  });
-
-  const action = new TestableAction();
-  action.registerForTest(pom);
-
-  await action.click(pom.loginBtn);
-
-  // POM is source of truth -> updated from POM
-  expect(savedCalls.length).toBe(0);
-  expect(updateCalls.length).toBe(1);
-
-  const u = updateCalls[0];
-  expect(u.name).toBe(NAME);
-  // stored primary is the POM locator (NOT the old stored one)
-  expect(u.primary).toBe(pomPrimary);
-  // a fresh smart bundle + meta were regenerated from the working element
-  expect(u.smart).toBeTruthy();
-  expect(u.meta).toHaveProperty('matchIndex');
-});
-
-// =============================================================================
-// STEP 4 — POM broken -> heals, test passes, but writes NOTHING
-// (This is the inverse of the removed auto-refresh feature.)
-// =============================================================================
-test('POM broken -> heals via fallback, but DB is NOT written', async ({ page }) => {
-  await page.goto(FIXTURE);
-
-  // POM locator that does NOT exist -> action's try fails -> findWithFallback runs.
-  // The DB has a smart locator that resolves, so healing succeeds.
-  const brokenPom = page.getByRole('button', { name: 'DOES_NOT_EXIST', exact: true });
-
-  // findWithFallback reads getElement: give it a broken primary + a working
-  // smart locator (text 'Login') so it heals at the smart tier.
-  getReturn = () => ({
-    element_name: 'Unknown_Element',   // brokenPom isn't registered; name resolves to this
-    primary_locator: "getByRole('button', { name: 'DOES_NOT_EXIST', exact: true })",
-    smart_locators: { text: "getByText('Login', { exact: true })" },
-    meta: {},
-  });
-
-  const action = new TestableAction();
-
-  // Act: clicking the broken locator forces the heal path.
-  await action.click(brokenPom);
-
-  // Healing kept the test alive, but model A writes NOTHING on the heal path.
-  expect(savedCalls.length).toBe(0);
-  expect(updateCalls.length).toBe(0);
-});
