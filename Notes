@@ -1,95 +1,238 @@
-Running 3 tests using 1 worker
-[chrome] › tests\refreshtest.spec.ts:75:5 › db primary still works -> no refresh
-[Test        ] refresh-1
-[Element     ] login_btn
-[Page        ] file:///C:/Users/nivetha.samraj/Documents/Knitwell_FinalVersion/locator-lab.html
-[AI SELF-HEALING STARTED] Azure_OpenAI
+POM works, element not in DB → full capture (saveElement called)
+POM works, stored primary == POM → nothing written
+POM works, stored primary != POM → updateElementFromPOM called with the POM locator + regenerated bundle
+POM broken → heals, test passes, but nothing written to DB (the inverse of the old test)
 
 
-──────────────────────────────────────────────────
- STEP 1 — DATABASE PRIMARY LOCATOR
-──────────────────────────────────────────────────
-[Trying      ] getByRole('button', { name: 'Login', exact: true })
- SUCCESS  DB Primary locator worked
-[chrome] › tests\refreshtest.spec.ts:95:5 › broken role primary heals via text -> new primary is STILL role + bundle refreshed
-[Test        ] refresh-2
-[Element     ] login_btn
-[Page        ] file:///C:/Users/nivetha.samraj/Documents/Knitwell_FinalVersion/locator-lab.html
-[AI SELF-HEALING STARTED] Azure_OpenAI
 
 
-──────────────────────────────────────────────────
- STEP 1 — DATABASE PRIMARY LOCATOR
-──────────────────────────────────────────────────
-[Trying      ] getByRole('button', { name: 'OLD_NAME', exact: true })
- WARNING  Locator matched 0 elements
- FAILED   DB Primary locator failed
 
 
-──────────────────────────────────────────────────
- STEP 2 — SMART LOCATOR FALLBACK
-──────────────────────────────────────────────────
-[Strategy    ] text
-[Locator     ] getByText('Login', { exact: true })
-[Result      ] SUCCESS
- SUCCESS  Element healed using text
 
 
-════════════════════════════════════════════════════════════
- HEALING COMPLETED
-════════════════════════════════════════════════════════════
-  1) [chrome] › tests\refreshtest.spec.ts:95:5 › broken role primary heals via text -> new primary is STILL role + bundle refreshed 
+/**
+ * modelA.syncFromPOM.spec.ts
+ *
+ * Verifies model A: the Page Object is the source of truth.
+ *
+ * syncFromPOM (in BrowserActionImpl) runs on the SUCCESS path (POM locator
+ * worked, no fallback). Its three branches:
+ *   1. element NOT in DB              -> full capture (saveElement)
+ *   2. stored primary == POM locator  -> nothing written
+ *   3. stored primary != POM locator  -> updateElementFromPOM (POM locator
+ *                                        + regenerated smart bundle)
+ *
+ * And the inverse of the old behavior:
+ *   4. POM locator BROKEN -> heals (test still passes) but writes NOTHING.
+ *
+ * Plain Playwright Test (no jest). The DB layer is monkeypatched so no live
+ * Postgres is needed and so we can observe exactly what was written.
+ *
+ * PATHS: adjust imports + FIXTURE to your repo.
+ */
 
-    Error: expect(received).toBe(expected) // Object.is equality
+import { test, expect, Page, Locator } from '@playwright/test';
+import path from 'path';
 
-    Expected: 1
-    Received: 0
+import BrowserActionImpl from '../src/core/actions/BrowserActionImpl';  // adjust
+import * as elementRepo from '../src/core/db/elementRepo';
+import * as healingRepo from '../src/core/db/healingRepo';
 
-      112 |
-      113 |   // refreshed exactly once
-    > 114 |   expect(refreshCalls.length).toBe(1);
-          |                               ^
-      115 |
-      116 |   const [name, newPrimary, smart, meta] = refreshCalls[0];
-      117 |
-        at C:\Users\nivetha.samraj\Documents\Knitwell_FinalVersion\tests\refreshtest.spec.ts:114:31
+// locator-lab.html has a Login button: role=button, name "Login", text "Login".
+const FIXTURE =
+  'file://' + path.resolve(__dirname, '../locator-lab.html');
 
-    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
-    test-results\tests-refreshtest-broken-r-9ef95-STILL-role-bundle-refreshed-chrome\test-failed-1.png
-    ────────────────────────────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Observable in-memory DB. We record saveElement and updateElementFromPOM
+// calls, and control what getElement returns per test.
+// ---------------------------------------------------------------------------
+type Row = {
+  element_name: string;
+  primary_locator: string;
+  smart_locators: any;
+  meta: any;
+};
 
-    attachment #2: video (video/webm) ──────────────────────────────────────────────────────────────
-    test-results\tests-refreshtest-broken-r-9ef95-STILL-role-bundle-refreshed-chrome\video.webm
-    ────────────────────────────────────────────────────────────────────────────────────────────────
+let savedCalls: Row[] = [];
+let updateCalls: { name: string; primary: string; smart: any; meta: any }[] = [];
+let getReturn: ((name: string) => any) | null = null;
 
-    Error Context: test-results\tests-refreshtest-broken-r-9ef95-STILL-role-bundle-refreshed-chrome\error-context.md
+let origSave: any, origGet: any, origUpdate: any, origLog: any;
 
-    attachment #4: trace (application/zip) ─────────────────────────────────────────────────────────
-    test-results\tests-refreshtest-broken-r-9ef95-STILL-role-bundle-refreshed-chrome\trace.zip
-    Usage:
+test.beforeEach(() => {
+  savedCalls = [];
+  updateCalls = [];
+  getReturn = () => null;
 
-        npx playwright show-trace test-results\tests-refreshtest-broken-r-9ef95-STILL-role-bundle-refreshed-chrome\trace.zip
+  origSave = (elementRepo as any).saveElement;
+  origGet = (elementRepo as any).getElement;
+  origUpdate = (elementRepo as any).updateElementFromPOM;
+  origLog = (healingRepo as any).saveHealingLog;
 
-    ────────────────────────────────────────────────────────────────────────────────────────────────
+  (healingRepo as any).saveHealingLog = async () => {};
 
-[chrome] › tests\refreshtest.spec.ts:133:5 › recompute/stored agree -> no write
-[Test        ] refresh-3
-[Element     ] login_btn
-[Page        ] file:///C:/Users/nivetha.samraj/Documents/Knitwell_FinalVersion/locator-lab.html
-[AI SELF-HEALING STARTED] Azure_OpenAI
+  (elementRepo as any).saveElement = async (data: any) => {
+    const row: Row = {
+      element_name: data.elementName,
+      primary_locator: data.primaryLocator,
+      smart_locators: data.smartLocators ?? {},
+      meta: data.meta ?? {},
+    };
+    savedCalls.push(row);
+    return row;
+  };
 
+  (elementRepo as any).getElement = async (name: string) => {
+    return getReturn ? getReturn(name) : null;
+  };
 
-──────────────────────────────────────────────────
- STEP 1 — DATABASE PRIMARY LOCATOR
-──────────────────────────────────────────────────
-[Trying      ] getByRole('button', { name: 'Login', exact: true })
- SUCCESS  DB Primary locator worked
-  1 failed
-    [chrome] › tests\refreshtest.spec.ts:95:5 › broken role primary heals via text -> new primary is STILL role + bundle refreshed 
-  2 passed (8.6s)
+  (elementRepo as any).updateElementFromPOM = async (
+    name: string, primary: string, smart: any, meta: any
+  ) => {
+    updateCalls.push({ name, primary, smart, meta });
+    return { element_name: name, primary_locator: primary };
+  };
+});
 
-To open last HTML report run:
+test.afterEach(() => {
+  (elementRepo as any).saveElement = origSave;
+  (elementRepo as any).getElement = origGet;
+  (elementRepo as any).updateElementFromPOM = origUpdate;
+  (healingRepo as any).saveHealingLog = origLog;
+});
 
-  npx playwright show-report
+// ---------------------------------------------------------------------------
+// Minimal POM + action shim. The element must be registered so it gets a name
+// (LoginPage_loginBtn). The POM locator is the live page locator the action
+// will try first.
+// ---------------------------------------------------------------------------
+class LoginPage {
+  readonly loginBtn: Locator;
+  constructor(page: Page) {
+    // primary (POM) locator — this is what gets compared against the DB
+    this.loginBtn = page.getByRole('button', { name: 'Login', exact: true });
+  }
+}
 
-PS C:\Users\nivetha.samraj\Documents\Knitwell_FinalVersion> 
+class TestableAction extends (BrowserActionImpl as any) {
+  registerForTest(pom: any) {
+    // @ts-ignore registerPageLocators is protected
+    this.registerPageLocators(pom);
+  }
+}
+
+// The element_name the framework assigns = `${pageName}_${key}` = LoginPage_loginBtn
+const NAME = 'LoginPage_loginBtn';
+// What getByRole(...).toString() yields is the POM "primary" string the action
+// compares. We capture it at runtime rather than hardcoding Playwright's format.
+
+// =============================================================================
+// STEP 1 — element not in DB -> full capture
+// =============================================================================
+test('POM works, not in DB -> captures (saveElement called)', async ({ page }) => {
+  await page.goto(FIXTURE);
+
+  getReturn = () => null;          // nothing stored yet
+
+  const action = new TestableAction();
+  const pom = new LoginPage(page);
+  action.registerForTest(pom);
+
+  await action.click(pom.loginBtn);
+
+  // first-capture path
+  expect(savedCalls.length).toBe(1);
+  expect(savedCalls[0].element_name).toBe(NAME);
+  // no POM-update on a first capture
+  expect(updateCalls.length).toBe(0);
+});
+
+// =============================================================================
+// STEP 2 — stored primary == POM locator -> nothing written
+// =============================================================================
+test('POM works, stored primary matches -> no write', async ({ page }) => {
+  await page.goto(FIXTURE);
+
+  const pom = new LoginPage(page);
+  const pomPrimary = pom.loginBtn.toString();   // exact stored form
+
+  getReturn = () => ({
+    element_name: NAME,
+    primary_locator: pomPrimary,                // identical -> leave it
+    smart_locators: {},
+    meta: {},
+  });
+
+  const action = new TestableAction();
+  action.registerForTest(pom);
+
+  await action.click(pom.loginBtn);
+
+  expect(savedCalls.length).toBe(0);    // not a first capture
+  expect(updateCalls.length).toBe(0);   // matches -> no update
+});
+
+// =============================================================================
+// STEP 3 — stored primary != POM locator -> updateElementFromPOM
+// =============================================================================
+test('POM works, stored primary differs -> updates DB from POM + regenerates bundle', async ({ page }) => {
+  await page.goto(FIXTURE);
+
+  const pom = new LoginPage(page);
+  const pomPrimary = pom.loginBtn.toString();
+
+  getReturn = () => ({
+    element_name: NAME,
+    // a DIFFERENT stored primary (as if the POM selector was changed)
+    primary_locator: "getByRole('button', { name: 'OLD_NAME', exact: true })",
+    smart_locators: {},
+    meta: {},
+  });
+
+  const action = new TestableAction();
+  action.registerForTest(pom);
+
+  await action.click(pom.loginBtn);
+
+  // POM is source of truth -> updated from POM
+  expect(savedCalls.length).toBe(0);
+  expect(updateCalls.length).toBe(1);
+
+  const u = updateCalls[0];
+  expect(u.name).toBe(NAME);
+  // stored primary is the POM locator (NOT the old stored one)
+  expect(u.primary).toBe(pomPrimary);
+  // a fresh smart bundle + meta were regenerated from the working element
+  expect(u.smart).toBeTruthy();
+  expect(u.meta).toHaveProperty('matchIndex');
+});
+
+// =============================================================================
+// STEP 4 — POM broken -> heals, test passes, but writes NOTHING
+// (This is the inverse of the removed auto-refresh feature.)
+// =============================================================================
+test('POM broken -> heals via fallback, but DB is NOT written', async ({ page }) => {
+  await page.goto(FIXTURE);
+
+  // POM locator that does NOT exist -> action's try fails -> findWithFallback runs.
+  // The DB has a smart locator that resolves, so healing succeeds.
+  const brokenPom = page.getByRole('button', { name: 'DOES_NOT_EXIST', exact: true });
+
+  // findWithFallback reads getElement: give it a broken primary + a working
+  // smart locator (text 'Login') so it heals at the smart tier.
+  getReturn = () => ({
+    element_name: 'Unknown_Element',   // brokenPom isn't registered; name resolves to this
+    primary_locator: "getByRole('button', { name: 'DOES_NOT_EXIST', exact: true })",
+    smart_locators: { text: "getByText('Login', { exact: true })" },
+    meta: {},
+  });
+
+  const action = new TestableAction();
+
+  // Act: clicking the broken locator forces the heal path.
+  await action.click(brokenPom);
+
+  // Healing kept the test alive, but model A writes NOTHING on the heal path.
+  expect(savedCalls.length).toBe(0);
+  expect(updateCalls.length).toBe(0);
+});
