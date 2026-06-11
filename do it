@@ -1,23 +1,493 @@
-Good — paths confirmed. Here's the complete procedure.
-The mechanism in one sentence
-When a test runs an action, the live POM locator is tried first; if it fails, findWithFallback runs, and the two page-vs-db comparisons happen there: STEP 1 checks if the DB primary still resolves (same → leave), and if not, after healing locates the element, refreshStaleElement recomputes the page primary and string-compares it to the DB primary (different → write primary + smart_locators + meta together).
-Step 1 — src/utils/selfHealing.ts
-Add these exports (the picker, the strategy-preserving picker, and the single-extraction bundle builder). Put them near your other exported helpers:
-typescriptconst PRIMARY_PRIORITY = [
-  'role', 'testId', 'label', 'placeholder',
-  'text', 'alt', 'title', 'css', 'xpath',
-] as const;
+import { Locator, Page } from '@playwright/test';
 
-/** Highest-priority locator available in a bundle. */
-export function pickBestPrimary(
-  s: Record<string, string | undefined>
-): string | undefined {
-  for (const k of PRIMARY_PRIORITY) if (s?.[k]) return s[k];
+export async function buildSmartLocatorBundle(
+  locator: Locator,
+  elementName: string
+) {
+
+  const meta =
+    await extractElementMeta(
+      locator
+    );
+
+  const smartLocators =
+    await generateSmartLocators(
+      locator.page(),
+      meta
+    );
+
+  return {
+    elementName,
+    meta,
+    smartLocators,
+    timestamp:
+      new Date()
+        .toISOString()
+  };
+}
+
+async function generateAncestorXpath(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
+
+  if (!meta.ancestors?.length) {
+    return undefined;
+  }
+
+  for (const ancestor of meta.ancestors) {
+
+    const anchors = [
+      {
+        attr: 'aria-label',
+        value: ancestor.ariaLabel
+      },
+      {
+        attr: 'name',
+        value: ancestor.name
+      },
+      {
+        attr: 'id',
+        value: ancestor.id
+      }
+    ];
+
+    for (const anchor of anchors) {
+
+      if (
+        !anchor.value ||
+        !isCleanValue(
+          anchor.value,
+          anchor.attr
+        )
+      ) {
+        continue;
+      }
+
+      let xp: string | undefined;
+
+      if (
+        meta.name &&
+        isCleanValue(
+          meta.name,
+          'name'
+        )
+      ) {
+
+        xp =
+          anchor.attr === 'id'
+            ? `//*[@id="${anchor.value}"]//${meta.tag}[@name="${meta.name}"]`
+            : `//*[@${anchor.attr}="${anchor.value}"]//${meta.tag}[@name="${meta.name}"]`;
+
+      } else if (
+        meta.placeholder &&
+        isCleanValue(
+          meta.placeholder,
+          'placeholder'
+        )
+      ) {
+
+        xp =
+          anchor.attr === 'id'
+            ? `//*[@id="${anchor.value}"]//${meta.tag}[@placeholder="${meta.placeholder}"]`
+            : `//*[@${anchor.attr}="${anchor.value}"]//${meta.tag}[@placeholder="${meta.placeholder}"]`;
+
+      } else {
+
+        xp =
+          anchor.attr === 'id'
+            ? `//*[@id="${anchor.value}"]//${meta.tag}`
+            : `//*[@${anchor.attr}="${anchor.value}"]//${meta.tag}`;
+      }
+
+      if (!isStableXpath(xp)) {
+        continue;
+      }
+
+      if (
+        await isUniqueXpath(
+          page,
+          xp
+        )
+      ) {
+        return xp;
+      }
+    }
+  }
+
   return undefined;
 }
 
-/** Which getBy* strategy an existing primary string uses. */
-function detectStrategy(primary: string): string | null {
+
+async function generateScopedCss(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
+
+  if (
+    !meta.ancestors?.length ||
+    !meta.name
+  ) {
+    return undefined;
+  }
+
+  for (
+    const ancestor
+    of meta.ancestors
+  ) {
+
+    if (
+      ancestor.ariaLabel &&
+      isCleanValue(
+        ancestor.ariaLabel,
+        'aria-label'
+      )
+    ) {
+
+      const css =
+        `[aria-label="${ancestor.ariaLabel}"] ${meta.tag}[name="${meta.name}"]`;
+
+      if (
+        await isUniqueCss(
+          page,
+          css
+        )
+      ) {
+
+        return css;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+export async function extractElementMeta(
+  locator: Locator
+) {
+
+  return locator.evaluate((el) => {
+
+    function getAncestorChain(
+      element: Element,
+      depth: number = 5
+    ) {
+
+      const ancestors: any[] = [];
+
+      let current =
+        element.parentElement;
+
+      while (
+        current &&
+        ancestors.length < depth
+      ) {
+
+        ancestors.push({
+          tag:
+            current.tagName.toLowerCase(),
+
+          id:
+            current.getAttribute('id'),
+
+          name:
+            current.getAttribute('name'),
+
+          ariaLabel:
+            current.getAttribute(
+              'aria-label'
+            ),
+
+          class:
+            current.getAttribute(
+              'class'
+            )
+        });
+
+        current =
+          current.parentElement;
+      }
+
+      return ancestors;
+    }
+
+    function getSiblingInfo(
+      element: Element
+    ) {
+
+      return Array.from(
+        element.parentElement?.children || []
+      )
+        .filter(
+          sibling => sibling !== element
+        )
+        .slice(0, 5)
+        .map(sibling => ({
+          tag:
+            sibling.tagName.toLowerCase(),
+
+          text:
+            sibling.textContent
+              ?.trim()
+              ?.substring(0, 100),
+
+          ariaLabel:
+            sibling.getAttribute(
+              'aria-label'
+            ),
+
+          name:
+            sibling.getAttribute(
+              'name'
+            ),
+
+          id:
+            sibling.getAttribute(
+              'id'
+            )
+        }));
+    }
+
+    function getMatchIndex(
+      element: Element
+    ): number {
+
+      const tag =
+        element.tagName.toLowerCase();
+
+      const text =
+        element.textContent?.trim() || '';
+
+      const all = Array.from(
+        document.querySelectorAll(tag)
+      ).filter(
+        e =>
+          (e.textContent?.trim() || '') === text
+      );
+
+      return all.indexOf(element);
+    }
+
+    return {
+
+      tag:
+        el.tagName.toLowerCase(),
+
+      text:
+        el.textContent?.trim(),
+
+      ancestors:
+        getAncestorChain(el),
+
+      siblings:
+        getSiblingInfo(el),
+
+      id:
+        el.getAttribute('id'),
+
+      class:
+        el.getAttribute('class'),
+
+      name:
+        el.getAttribute('name'),
+
+      type:
+        el.getAttribute('type'),
+
+      placeholder:
+        el.getAttribute(
+          'placeholder'
+        ),
+
+      label:
+        el.getAttribute(
+          'aria-label'
+        ),
+
+      role:
+        el.getAttribute(
+          'role'
+        ),
+
+      alt:
+        el.getAttribute(
+          'alt'
+        ),
+
+      title:
+        el.getAttribute(
+          'title'
+        ),
+
+      testId:
+        el.getAttribute(
+          'data-testid'
+        ),
+
+      dataTest:
+        el.getAttribute(
+          'data-test'
+        ),
+
+      value:
+        el.getAttribute(
+          'value'
+        ),
+
+      outerHTML:
+        el.outerHTML,
+
+      matchIndex:
+        getMatchIndex(el)
+    };
+  });
+}
+
+export function containsDynamicId(
+  locator: string
+): boolean {
+
+  const lower = locator.toLowerCase();
+
+  // URLs are allowed
+  if (
+    lower.includes('href=') ||
+    lower.includes('src=')
+  ) {
+    return false;
+  }
+
+  const matches =
+    locator.match(
+      /['"]([^'"]+)['"]/g
+    );
+
+  if (!matches) {
+    return false;
+  }
+
+  return matches.some(m =>
+    isLikelyDynamicValue(
+      m.replace(/['"]/g, '')
+    )
+  );
+}
+
+/**
+ * Reject:
+ * //input[1]
+ * //div[2]
+ * ancestor::div[3]
+ * following::input[1]
+ */
+
+export function containsXPathIndex(
+  xpath: string
+): boolean {
+
+  return /\[\d+\]/.test(xpath);
+}
+
+/**
+ * Reject positional XPath logic
+ */
+
+export function containsPositionalXPath(
+  xpath: string
+): boolean {
+
+  return (
+    /\[\d+\]/.test(xpath) ||
+    /position\s*\(/i.test(xpath) ||
+    /last\s*\(/i.test(xpath)
+  );
+}
+
+
+export function isStableXpath(
+  xpath: string
+): boolean {
+
+  if (
+    containsDynamicId(xpath)
+  ) {
+
+    console.log(
+      `REJECTED DYNAMIC XPATH: ${xpath}`
+    );
+
+    return false;
+  }
+
+  if (
+    containsPositionalXPath(xpath)
+  ) {
+
+    console.log(
+      `REJECTED INDEXED XPATH: ${xpath}`
+    );
+
+    return false;
+  }
+
+  return true;
+}
+
+
+type SmartLocatorResult = {
+  role?: string;
+  testId?: string;
+  label?: string;
+  placeholder?: string;
+  text?: string;
+  alt?: string;
+  title?: string;
+  css?: string;
+  xpath?: string;
+};
+
+// =========================================================
+// PRIMARY SELECTION HELPERS
+// Used when refreshing a stale DB primary after healing.
+// =========================================================
+
+const PRIMARY_PRIORITY = [
+  'role',
+  'testId',
+  'label',
+  'placeholder',
+  'text',
+  'alt',
+  'title',
+  'css',
+  'xpath',
+] as const;
+
+/**
+ * Highest-priority locator available in a smart-locator bundle.
+ * Mirrors the priority order the fallback engine trusts.
+ */
+export function pickBestPrimary(
+  s: Record<string, string | undefined>
+): string | undefined {
+
+  for (const k of PRIMARY_PRIORITY) {
+    if (s?.[k]) {
+      return s[k];
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Which getBy* strategy an existing primary locator string uses.
+ * Returns null for css / xpath / raw locators.
+ */
+function detectStrategy(
+  primary: string
+): string | null {
+
   if (primary.startsWith('getByRole')) return 'role';
   if (primary.startsWith('getByTestId')) return 'testId';
   if (primary.startsWith('getByLabel')) return 'label';
@@ -25,7 +495,8 @@ function detectStrategy(primary: string): string | null {
   if (primary.startsWith('getByText')) return 'text';
   if (primary.startsWith('getByAltText')) return 'alt';
   if (primary.startsWith('getByTitle')) return 'title';
-  return null; // css / xpath / raw
+
+  return null;
 }
 
 /**
@@ -37,227 +508,1316 @@ export function pickMatchingPrimary(
   s: Record<string, string | undefined>,
   oldPrimary: string | null
 ): string | undefined {
+
   if (oldPrimary) {
+
     const strat = detectStrategy(oldPrimary);
-    if (strat && s[strat]) return s[strat];
+
+    if (strat && s[strat]) {
+      return s[strat];
+    }
   }
+
   return pickBestPrimary(s);
 }
 
+async function isUniqueAlt(
+  page: Page,
+  alt: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByAltText(
+          alt,
+          { exact: true }
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+async function isUniqueTitle(
+  page: Page,
+  title: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByTitle(
+          title,
+          { exact: true }
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+function isLikelyDynamicValue(
+  value: string,
+  attr?: string
+): boolean {
+
+  const v = value.trim();
+
+  // UUID
+
+  if (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}/i.test(v)
+  ) {
+    return true;
+  }
+
+  // Random IDs
+
+  if (
+    /^[A-Za-z0-9_-]{20,}$/.test(v) &&
+    /[A-Z]/.test(v) &&
+    /[a-z]/.test(v) &&
+    /\d/.test(v)
+  ) {
+    return true;
+  }
+
+  // Mixed random string
+
+  if (
+    /[A-Z]/.test(v) &&
+    /[a-z]/.test(v) &&
+    /\d/.test(v) &&
+    v.length > 15
+  ) {
+    return true;
+  }
+
+  // React / Angular / Material
+
+  if (
+    /(react|mui|mat|cdk|ng)/i.test(v) &&
+    /\d/.test(v)
+  ) {
+    return true;
+  }
+
+  // Ends with large number
+
+  if (
+    /[-_]\d{3,}$/.test(v)
+  ) {
+    return true;
+  }
+
+  // Long hashes
+
+  if (
+    /[0-9a-f]{8,}/i.test(v)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function isCleanValue(
+  value: string,
+  attr?: string
+): boolean {
+
+  const t = value.trim();
+
+  if (!t) {
+    return false;
+  }
+
+  const attribute =
+    attr?.toLowerCase() || '';
+
+  // =====================================
+  // DYNAMIC VALUE DETECTION
+  // =====================================
+
+  if (
+    isLikelyDynamicValue(
+      t,
+      attribute
+    )
+  ) {
+    return false;
+  }
+
+  // =====================================
+  // HUMAN READABLE ATTRIBUTES
+  // =====================================
+
+  if (
+    [
+      'aria-label',
+      'placeholder',
+      'title',
+      'alt'
+    ].includes(attribute)
+  ) {
+
+    if (t.length > 120) {
+      return false;
+    }
+
+    return true;
+  }
+
+  // =====================================
+  // ID / NAME / TEST ATTRIBUTES
+  // =====================================
+
+  if (
+    [
+      'id',
+      'name',
+      'data-testid',
+      'data-test'
+    ].includes(attribute)
+  ) {
+
+    if (t.length > 60) {
+      return false;
+    }
+
+    return true;
+  }
+
+  // =====================================
+  // DEFAULT RULES
+  // =====================================
+
+  if (t.length > 60) {
+    return false;
+  }
+
+  return true;
+}
+
+async function isUniquePlaceholder(
+  page: Page,
+  value: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByPlaceholder(
+          value
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+async function isUniqueLabel(
+  page: Page,
+  label: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByLabel(label, {
+          exact: true
+        })
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+async function isUniqueText(
+  page: Page,
+  text: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .getByText(
+          text,
+          { exact: true }
+        )
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+export async function generateSmartLocators(
+  page: Page,
+  meta: any
+): Promise<SmartLocatorResult> {
+
+  const locators: SmartLocatorResult = {};
+
+  // =====================================================
+  // ROLE
+  // =====================================================
+
+  const role = inferRole(meta);
+  const name = getAccessibleName(meta);
+
+  if (
+    role &&
+    name &&
+    isCleanValue(name, 'aria-label') &&
+    await isUniqueRole(page, role, name)
+  ) {
+
+    locators.role =
+      `getByRole('${role}', { name: '${escapeLocatorValue(name)}', exact: true })`;
+  }
+
+  // =====================================================
+  // TEST ID
+  // =====================================================
+
+  if (
+    meta.testId &&
+    isCleanValue(
+      meta.testId,
+      'data-testid'
+    )
+  ) {
+
+    const count =
+      await page
+        .getByTestId(meta.testId)
+        .count();
+
+    if (count === 1) {
+
+      locators.testId =
+        `getByTestId('${escapeLocatorValue(meta.testId)}')`;
+    }
+  }
+
+  // =====================================================
+  // LABEL
+  // =====================================================
+
+  if (
+    meta.label &&
+    isCleanValue(
+      meta.label,
+      'aria-label'
+    ) &&
+    await isUniqueLabel(
+      page,
+      meta.label
+    )
+  ) {
+
+    locators.label =
+      `getByLabel('${escapeLocatorValue(meta.label)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // PLACEHOLDER
+  // =====================================================
+
+  if (
+    meta.placeholder &&
+    isCleanValue(
+      meta.placeholder,
+      'placeholder'
+    ) &&
+    await isUniquePlaceholder(
+      page,
+      meta.placeholder
+    )
+  ) {
+
+    locators.placeholder =
+      `getByPlaceholder('${escapeLocatorValue(meta.placeholder)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // TEXT
+  // =====================================================
+
+  if (
+    meta.text &&
+    meta.text.length < 80 &&
+    !isLikelyDynamicValue(meta.text) &&
+    await isUniqueText(
+      page,
+      meta.text
+    )
+  ) {
+
+    locators.text =
+      `getByText('${escapeLocatorValue(meta.text)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // ALT
+  // =====================================================
+
+  if (
+    meta.alt &&
+    isCleanValue(
+      meta.alt,
+      'alt'
+    ) &&
+    await isUniqueAlt(
+      page,
+      meta.alt
+    )
+  ) {
+
+    locators.alt =
+      `getByAltText('${escapeLocatorValue(meta.alt)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // TITLE
+  // =====================================================
+
+  if (
+    meta.title &&
+    isCleanValue(
+      meta.title,
+      'title'
+    ) &&
+    await isUniqueTitle(
+      page,
+      meta.title
+    )
+  ) {
+
+    locators.title =
+      `getByTitle('${escapeLocatorValue(meta.title)}', { exact: true })`;
+  }
+
+  // =====================================================
+  // CSS
+  // FIX: previously the scoped-CSS fallback result was discarded.
+  // Now its return value is assigned through.
+  // =====================================================
+
+  locators.css =
+    await generateStableCss(
+      page,
+      meta
+    );
+
+  if (!locators.css) {
+
+    locators.css =
+      await generateScopedCss(
+        page,
+        meta
+      );
+  }
+
+  // =====================================================
+  // XPATH
+  // FIX: previously the ancestor-XPath fallback result was discarded.
+  // Now its return value is assigned through.
+  // =====================================================
+
+  locators.xpath =
+    await generateStableXpath(
+      page,
+      meta
+    );
+
+  if (!locators.xpath) {
+
+    locators.xpath =
+      await generateAncestorXpath(
+        page,
+        meta
+      );
+  }
+
+  return locators;
+}
+
 /**
- * ONE extractElementMeta call on a working (healed) locator ->
- * a consistent {primary, smartLocators, meta}. meta carries
- * matchIndex and MUST be stored alongside smartLocators.
+ * Given a WORKING (healed) locator on the current page, perform a single
+ * meta extraction and produce a consistent bundle:
+ *   - primary       : the best primary, preserving the old strategy if possible
+ *   - smartLocators : the full regenerated bundle
+ *   - meta          : carries matchIndex; MUST be stored alongside smartLocators
+ *
+ * Returns null if no usable primary could be derived from the element.
  */
 export async function recomputeBundleFromElement(
   locator: Locator,
   oldPrimary: string | null
 ): Promise<{ primary: string; smartLocators: any; meta: any } | null> {
-  const meta = await extractElementMeta(locator);
-  const smartLocators = await generateSmartLocators(locator.page(), meta);
-  const primary = pickMatchingPrimary(smartLocators, oldPrimary);
-  if (!primary) return null;
-  return { primary, smartLocators, meta };
-}
-extractElementMeta and generateSmartLocators are already in this file, so no new imports here.
-Step 2 — src/core/db/elementRepo.ts
-Append the focused refresh method (primary + smart_locators + meta only; screenshots/DOM untouched):
-typescriptexport async function refreshElementLocators(
-  elementName: string,
-  primaryLocator: string,
-  smartLocators: any,
-  meta: any
-) {
-  const result = await pool.query(
-    `UPDATE elements
-        SET primary_locator = $2,
-            smart_locators  = $3,
-            meta            = $4,
-            updated_at      = CURRENT_TIMESTAMP
-      WHERE element_name = $1
-      RETURNING element_name, primary_locator;`,
-    [
-      elementName,
-      primaryLocator,
-      JSON.stringify(smartLocators ?? {}),
-      JSON.stringify(meta ?? {}),
-    ]
-  );
 
-  console.log('REFRESHED ELEMENT:', {
-    name: result.rows[0]?.element_name,
-    primary: result.rows[0]?.primary_locator,
-  });
+  const meta =
+    await extractElementMeta(locator);
 
-  return result.rows[0] || null;
-}
-Step 3 — src/core/healing/fallbackEngine.ts
-3a — imports. Change two existing import lines:
-typescript// was: import { getElement } from '../db/elementRepo';
-import { getElement, refreshElementLocators } from '../db/elementRepo';
-
-// add recomputeBundleFromElement to the selfHealing import
-import {
-  getMinimalFullDOM,
-  containsDynamicId,
-  recomputeBundleFromElement,
-} from '../../utils/selfHealing';
-3b — the refresh helper. Add above findWithFallback. This holds comparison #2 (the ===):
-typescriptasync function refreshStaleElement(
-  healed: Locator,
-  elementName: string,
-  dbPrimary: string | null
-): Promise<void> {
-  try {
-    const b = await recomputeBundleFromElement(healed, dbPrimary);
-
-    if (!b) {
-      HealingLogger.warn('No primary recomputed from healed element');
-      return;
-    }
-
-    // ===== COMPARISON #2: recomputed page primary vs stored db primary =====
-    if (b.primary === dbPrimary) {
-      HealingLogger.info('Primary', 'Recomputed equals DB; no write');
-      return;                      // same -> leave it
-    }
-
-    // different -> update primary + smart_locators + meta together
-    await refreshElementLocators(
-      elementName, b.primary, b.smartLocators, b.meta
+  const smartLocators =
+    await generateSmartLocators(
+      locator.page(),
+      meta
     );
-    HealingLogger.success(`DB refreshed -> primary: ${b.primary}`);
 
-  } catch (e: any) {
-    // refresh must NEVER break the heal itself
-    HealingLogger.warn(`Refresh skipped: ${e?.message || 'unknown'}`);
+  const primary =
+    pickMatchingPrimary(
+      smartLocators,
+      oldPrimary
+    );
+
+  if (!primary) {
+    return null;
+  }
+
+  return {
+    primary,
+    smartLocators,
+    meta
+  };
+}
+
+function escapeLocatorValue(
+  value: string
+): string {
+
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'");
+}
+
+async function isUniqueXpath(
+  page: Page,
+  xpath: string
+): Promise<boolean> {
+
+  if (!isStableXpath(xpath)) {
+    return false;
+  }
+
+  try {
+
+    const count =
+      await page
+        .locator(`xpath=${xpath}`)
+        .count();
+
+    return count === 1;
+
+  } catch {
+
+    return false;
   }
 }
-3c — STEP 1 is comparison #1, already in your code. No change. For clarity, this existing block is the "db primary still resolves → page == db → leave it" half:
-typescriptconst dbPrimary = buildLocator(page, dbPrimaryLocatorStr);
-if (dbPrimary && await isValidLocator(dbPrimary)) {
-  // ... existing saveHealingLog ...
-  return { locator: dbPrimary, usedStrategy: 'db-primary' };   // no refresh
+async function generateStableCss(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
+
+  const candidates = [
+
+    {
+      attr: 'data-testid',
+      value: meta.testId
+    },
+
+    {
+      attr: 'data-test',
+      value: meta.dataTest
+    },
+
+    {
+      attr: 'aria-label',
+      value: meta.label
+    },
+
+    {
+      attr: 'placeholder',
+      value: meta.placeholder
+    },
+
+    {
+      attr: 'name',
+      value: meta.name
+    },
+
+    {
+      attr: 'title',
+      value: meta.title
+    },
+
+    {
+      attr: 'alt',
+      value: meta.alt
+    },
+
+    {
+      attr: 'id',
+      value: meta.id
+    }
+  ];
+
+  for (const candidate of candidates) {
+
+    if (
+      !candidate.value ||
+      !isCleanValue(
+        candidate.value,
+        candidate.attr
+      )
+    ) {
+      continue;
+    }
+
+    const selector =
+      candidate.attr === 'id'
+        ? `#${candidate.value}`
+        : `${meta.tag}[${candidate.attr}="${candidate.value}"]`;
+
+    if (
+      await isUniqueCss(
+        page,
+        selector
+      )
+    ) {
+      return selector;
+    }
+  }
+
+  if (meta.class) {
+
+    const stableClass =
+      meta.class
+        .split(' ')
+        .find(
+          (c: string) =>
+            isCleanValue(
+              c,
+              'class'
+            )
+        );
+
+    if (stableClass) {
+
+      const selector =
+        `${meta.tag}.${stableClass}`;
+
+      if (
+        await isUniqueCss(
+          page,
+          selector
+        )
+      ) {
+        return selector;
+      }
+    }
+  }
+
+  return undefined;
 }
-3d — call refresh on the smart-tier success branch. Inside the for (const key of priority) loop, after saveHealingLog, before return:
-typescript      await saveHealingLog({ /* unchanged */ });
 
-      await refreshStaleElement(built, elementName, dbPrimaryLocatorStr);
+async function isUniqueRole(
+  page: Page,
+  role: string,
+  name: string
+): Promise<boolean> {
 
-      HealingLogger.section('HEALING COMPLETED');
-      return { locator: built, usedStrategy: key };
-3e — call refresh on the AI-tier success branch. Inside if (isValid), after saveHealingLog, before return, using aiLocator:
-typescript      await saveHealingLog({ /* unchanged */ });
+  try {
 
-      await refreshStaleElement(aiLocator, elementName, dbPrimaryLocatorStr);
+    return (
+      await page
+        .getByRole(
+          role as any,
+          {
+            name,
+            exact: true
+          }
+        )
+        .count()
+    ) === 1;
 
-      HealingLogger.section('HEALING COMPLETED');
-      return { locator: aiLocator, usedStrategy: resolvedStrategy };
-No refresh on the catch/failure branch — nothing was located, nothing to recompute.
-Step 4 — nothing in BrowserActionImpl
-Capture (captureAndStore, if (!exists)) still owns first-ever storage. Refresh owns updates. They don't overlap.
-The two comparison points, summarized
-WhereHow it comparesOutcome#1STEP 1, isValidLocator(dbPrimary)by resolution — does the stored string still find the element?resolves → leave, return#2refreshStaleElement, b.primary === dbPrimaryby string — recomputed page primary vs storedequal → leave; different → write
-#1 catches the common "still works" case cheaply; #2 catches "it changed, here's the new one" after healing gives you a handle to recompute from.
-Test spec — tests/refreshElement.spec.ts
-DB layer stubbed; page logic real (recompute must run against the live DOM via your fixture).
-typescriptimport { test, expect } from '@playwright/test';
-import path from 'path';
+  } catch {
 
-import { findWithFallback } from '../src/core/healing/fallbackEngine';
-import * as elementRepo from '../src/core/db/elementRepo';
-import * as healingRepo from '../src/core/db/healingRepo';
+    return false;
+  }
+}
+async function generateStableXpath(
+  page: Page,
+  meta: any
+): Promise<string | undefined> {
 
-const FIXTURE_URL =
-  'file://' + path.resolve(__dirname, '../fixtures/locator-lab.html');
+  const candidates: string[] = [];
 
-test.beforeEach(() => {
-  jest.spyOn(healingRepo, 'saveHealingLog').mockResolvedValue(undefined as any);
-});
-test.afterEach(() => jest.restoreAllMocks());
+  if (
+    meta.testId &&
+    isCleanValue(
+      meta.testId,
+      'data-testid'
+    )
+  ) {
 
-// ---- Comparison #1: db primary still resolves -> NO refresh ----
-test('db primary still works -> no write', async ({ page }) => {
-  await page.goto(FIXTURE_URL);
+    candidates.push(
+      `//*[@data-testid="${meta.testId}"]`
+    );
+  }
 
-  jest.spyOn(elementRepo, 'getElement').mockResolvedValue({
-    element_name: 'login_btn',
-    primary_locator: "getByRole('button', { name: 'Login', exact: true })",
-    smart_locators: {}, meta: {},
-  } as any);
+  if (
+    meta.dataTest &&
+    isCleanValue(
+      meta.dataTest,
+      'data-test'
+    )
+  ) {
 
-  const refresh = jest
-    .spyOn(elementRepo, 'refreshElementLocators').mockResolvedValue({} as any);
+    candidates.push(
+      `//*[@data-test="${meta.dataTest}"]`
+    );
+  }
 
-  const dummy = page.getByRole('button', { name: 'Login', exact: true });
-  const res = await findWithFallback(page, 'login_btn', dummy, 'r1');
+  if (
+    meta.name &&
+    isCleanValue(
+      meta.name,
+      'name'
+    )
+  ) {
 
-  expect(res.usedStrategy).toBe('db-primary');
-  expect(refresh).not.toHaveBeenCalled();
-});
+    candidates.push(
+      `//${meta.tag}[@name="${meta.name}"]`
+    );
+  }
 
-// ---- Comparison #2: broken primary, smart heals -> refresh, strategy preserved ----
-test('broken role primary heals -> new primary still a role locator + bundle refreshed', async ({ page }) => {
-  await page.goto(FIXTURE_URL);
+  if (
+    meta.label &&
+    isCleanValue(
+      meta.label,
+      'aria-label'
+    )
+  ) {
 
-  jest.spyOn(elementRepo, 'getElement').mockResolvedValue({
-    element_name: 'login_btn',
-    // OLD strategy = role, with a stale name -> STEP 1 fails
-    primary_locator: "getByRole('button', { name: 'OLD_NAME', exact: true })",
-    // a lower-priority smart locator that still resolves -> heals via text
-    smart_locators: { text: "getByText('Login', { exact: true })" },
-    meta: {},
-  } as any);
+    candidates.push(
+      `//${meta.tag}[@aria-label="${meta.label}"]`
+    );
+  }
 
-  const refresh = jest
-    .spyOn(elementRepo, 'refreshElementLocators').mockResolvedValue({} as any);
+  if (
+    meta.placeholder &&
+    isCleanValue(
+      meta.placeholder,
+      'placeholder'
+    )
+  ) {
 
-  const dummy = page.getByRole('button', { name: 'OLD_NAME', exact: true });
-  const res = await findWithFallback(page, 'login_btn', dummy, 'r2');
+    candidates.push(
+      `//${meta.tag}[@placeholder="${meta.placeholder}"]`
+    );
+  }
 
-  expect(res.usedStrategy).toBe('text');         // healed via smart text tier
-  expect(refresh).toHaveBeenCalledTimes(1);
+  if (
+    meta.title &&
+    isCleanValue(
+      meta.title,
+      'title'
+    )
+  ) {
 
-  const [name, newPrimary, smart, meta] = refresh.mock.calls[0];
-  expect(name).toBe('login_btn');
+    candidates.push(
+      `//${meta.tag}[@title="${meta.title}"]`
+    );
+  }
 
-  // Option B: strategy preserved -> still getByRole (value refreshed),
-  // NOT the text locator that happened to heal it.
-  expect(newPrimary).toContain('getByRole');
-  expect(newPrimary).not.toBe("getByText('Login', { exact: true })");
+  if (
+    meta.alt &&
+    isCleanValue(
+      meta.alt,
+      'alt'
+    )
+  ) {
 
-  // primary + smart + meta written together; matchIndex travels with meta
-  expect(smart).toBeTruthy();
-  expect(meta).toHaveProperty('matchIndex');
-});
+    candidates.push(
+      `//${meta.tag}[@alt="${meta.alt}"]`
+    );
+  }
 
-// ---- Comparison #2 short-circuit: recomputed == stored -> no redundant write ----
-test('recomputed equals stored -> no write', async ({ page }) => {
-  await page.goto(FIXTURE_URL);
+  if (
+    meta.id &&
+    isCleanValue(
+      meta.id,
+      'id'
+    )
+  ) {
 
-  // store EXACTLY what the recompute will produce for this element,
-  // but force STEP 1 to fail via a separate broken POM locator path.
-  // (If recompute == stored, the === short-circuit must skip the write.)
-  const recomputedValue = "getByRole('button', { name: 'Login', exact: true })";
+    candidates.push(
+      `//*[@id="${meta.id}"]`
+    );
+  }
 
-  jest.spyOn(elementRepo, 'getElement').mockResolvedValue({
-    element_name: 'login_btn',
-    primary_locator: recomputedValue,            // same as recompute will yield
-    smart_locators: { role: recomputedValue },   // resolves -> STEP 1 succeeds...
-    meta: {},
-  } as any);
+  for (const xp of candidates) {
 
-  const refresh = jest
-    .spyOn(elementRepo, 'refreshElementLocators').mockResolvedValue({} as any);
+    if (!isStableXpath(xp)) {
+      continue;
+    }
 
-  const dummy = page.getByRole('button', { name: 'Login', exact: true });
-  await findWithFallback(page, 'login_btn', dummy, 'r3');
+    if (
+      await isUniqueXpath(
+        page,
+        xp
+      )
+    ) {
 
-  // STEP 1 resolves here, so refresh never runs -> proves "same -> leave"
-  expect(refresh).not.toHaveBeenCalled();
-});
-A note on the third test: because the stored primary resolves, STEP 1 short-circuits and refresh never runs — which itself demonstrates comparison #1. To exercise comparison #2's === short-circuit directly (STEP 1 fails but recompute equals stored), you'd need a fixture where the primary is transiently invalid yet recomputes identically — hard to stage deterministically, so the resolution-based #1 check is the practical guard. I left the test asserting the no-write outcome either way.
-For test 2 to pass, your locator-lab.html login button must expose a unique role + accessible name "Login" (so the recompute emits a role entry to preserve as the new primary), while also having getByText('Login') resolve. If the button's real attributes differ, tell me and I'll retarget the assertion (e.g. to getByTestId if that's the highest-priority strategy it supports).
-Two finalizers I still need:
-Your test runner — Playwright Test alone, or with Jest? The spec uses jest.spyOn; if you're on plain Playwright Test I'll convert the three spies to sinon or manual module mocks (structure stays identical).
-And the login button's actual attributes in your fixture, so the strategy-preservation assertion in test 2 matches what generateSmartLocators will really emit.Opus 4.8 HighClaude is AI and can 
+      return xp;
+    }
+  }
+
+  return undefined;
+}
+async function isUniqueCss(
+  page: Page,
+  selector: string
+): Promise<boolean> {
+
+  try {
+
+    return (
+      await page
+        .locator(selector)
+        .count()
+    ) === 1;
+
+  } catch {
+
+    return false;
+  }
+}
+
+
+function inferRole(meta: any): string | null {
+
+  /**
+   * USE EXPLICIT ROLE FIRST
+   */
+
+  if (meta.role) {
+    return meta.role;
+  }
+
+  const tag =
+    meta.tag?.toLowerCase();
+
+  const type =
+    meta.type?.toLowerCase();
+
+  switch (tag) {
+
+    /**
+     * BUTTON
+     */
+
+    case 'button':
+      return 'button';
+
+    /**
+     * LINK
+     */
+
+    case 'a':
+      return 'link';
+
+    /**
+     * INPUT TYPES
+     */
+
+    case 'input':
+
+      switch (type) {
+
+        case 'button':
+        case 'submit':
+        case 'reset':
+          return 'button';
+
+        case 'checkbox':
+          return 'checkbox';
+
+        case 'radio':
+          return 'radio';
+
+        case 'email':
+        case 'text':
+        case 'password':
+        case 'search':
+        case 'tel':
+        case 'url':
+        case 'number':
+          return 'textbox';
+
+        case 'range':
+          return 'slider';
+
+        case 'file':
+          return 'button';
+
+        default:
+          return 'textbox';
+      }
+
+    /**
+     * SELECT
+     */
+
+    case 'select':
+      return 'combobox';
+
+    /**
+     * TEXTAREA
+     */
+
+    case 'textarea':
+      return 'textbox';
+
+    /**
+     * IMAGE
+     */
+
+    case 'img':
+      return 'img';
+
+    default:
+      return null;
+  }
+}
+
+function getAccessibleName(
+  meta: any
+): string | null {
+
+  return (
+    meta.label ||
+    meta.placeholder ||
+    meta.alt ||
+    meta.text ||
+    meta.title ||
+    meta.name ||
+    null
+  );
+}
+
+export async function captureElementScreenshot(locator: Locator): Promise<Buffer> {
+  const page = locator.page();
+
+  try {
+    const container = locator.locator(
+      'xpath=ancestor::*[contains(@class,"form") or contains(@class,"field") or contains(@class,"group")][1]'
+    );
+
+    if (await container.first().isVisible().catch(() => false)) {
+      return await container.first().screenshot({ type: 'jpeg', quality: 70 });
+    }
+  
+    const id = await locator.getAttribute('id');
+    if (id) {
+      const label = page.locator(`label[for="${id}"]`);
+      if (await label.first().isVisible().catch(() => false)) {
+        const wrapper = label.locator('xpath=ancestor::*[1]');
+        return await wrapper.first().screenshot({ type: 'jpeg', quality: 70 });
+      }
+    }
+
+    const ariaLabelledBy = await locator.getAttribute('aria-labelledby');
+    if (ariaLabelledBy) {
+      
+    
+      const label = page.locator(`#${ariaLabelledBy}`);
+      if (await label.first().isVisible().catch(() => false)) {
+        const wrapper = label.locator('xpath=ancestor::*[1]');
+        return await wrapper.first().screenshot({ type: 'jpeg', quality: 70 });
+      }
+    }
+  
+
+    const ancestor = locator.locator('xpath=ancestor::div[1]');
+    if (await ancestor.first().isVisible().catch(() => false)) {
+      return await ancestor.first().screenshot({ type: 'jpeg', quality: 70 });
+    }
+
+    return await locator.screenshot({ type: 'jpeg', quality: 70 });
+
+  } catch {
+    return await locator.screenshot({ type: 'jpeg', quality: 70 });
+  }
+
+}
+
+export async function captureFullPageScreenshot(page: Page): Promise<Buffer> {
+  return await page.screenshot({
+    fullPage: true,
+    type: 'jpeg',
+    quality: 70, // reduce size
+  });
+}
+
+
+export async function getElementOuterHTML(locator: Locator): Promise<string> {
+  return await locator.evaluate((el) => {
+    const clone = el.cloneNode(true) as HTMLElement;
+
+    // Remove noisy attributes
+    clone.removeAttribute('style');
+
+    [...clone.attributes].forEach(attr => {
+      if (attr.name.startsWith('data-')) {
+        clone.removeAttribute(attr.name);
+      }
+    });
+
+    return clone.outerHTML;
+  });
+}
+
+export async function getMinimalFullDOM(
+  page: Page,
+  maxLength: number = 15000
+): Promise<string> {
+
+  return await page.evaluate((maxLength) => {
+
+    // Clone body to avoid modifying real DOM
+    const clone = document.body.cloneNode(true) as HTMLElement;
+
+    // =========================================
+    // REMOVE NOISE ELEMENTS
+    // =========================================
+
+    clone.querySelectorAll(`
+      script,
+      style,
+      noscript,
+      head,
+      svg,
+      picture,
+      video,
+      img,
+      iframe,
+      canvas,
+      link,
+      meta,
+      source,
+      track,
+      audio
+    `).forEach(el => el.remove());
+
+    // =========================================
+    // REMOVE HIDDEN ELEMENTS
+    // =========================================
+
+    clone.querySelectorAll(`
+      .hidden,
+      [hidden],
+      input[type="hidden"],
+      [aria-hidden="true"]
+    `).forEach(el => el.remove());
+
+    // =========================================
+    // REMOVE COMMENTS
+    // =========================================
+
+    const walker = document.createTreeWalker(
+      clone,
+      NodeFilter.SHOW_COMMENT
+    );
+
+    const comments: Comment[] = [];
+
+    let node;
+
+    while ((node = walker.nextNode())) {
+      comments.push(node as Comment);
+    }
+
+    comments.forEach(comment => {
+      comment.parentNode?.removeChild(comment);
+    });
+
+    // =========================================
+    // REMOVE DYNAMIC / NOISY ATTRIBUTES
+    // =========================================
+
+    const cleanAttributes = (el: Element) => {
+
+      [...el.attributes].forEach(attr => {
+
+        const attrName = attr.name.toLowerCase();
+
+        if (
+          attrName.startsWith('data-') ||
+          attrName === 'style' ||
+          attrName === 'onclick' ||
+          attrName === 'onchange' ||
+          attrName === 'onmouseover' ||
+          attrName === 'onfocus' ||
+          attrName === 'tabindex'
+        ) {
+          el.removeAttribute(attr.name);
+        }
+
+        // Remove dynamic IDs
+        if (
+          attrName === 'id' &&
+          /^[a-zA-Z0-9_-]{20,}$/.test(attr.value)
+        ) {
+          el.removeAttribute('id');
+        }
+
+        // Remove long dynamic classes
+        if (
+          attrName === 'class' &&
+          attr.value.length > 200
+        ) {
+          el.removeAttribute('class');
+        }
+      });
+
+      Array.from(el.children).forEach(child => {
+        cleanAttributes(child);
+      });
+    };
+
+    cleanAttributes(clone);
+
+    // =========================================
+    // NORMALIZE WHITESPACE
+    // =========================================
+
+    let html = clone.innerHTML
+      .replace(/\s+/g, ' ')
+      .replace(/>\s+</g, '><')
+      .trim();
+
+    // =========================================
+    // LIMIT SIZE
+    // =========================================
+
+    if (html.length > maxLength) {
+      html = html.slice(0, maxLength);
+    }
+
+    return html;
+
+  }, maxLength);
+}
+
+
+export async function getElementContextDOM(
+  locator: Locator,
+  parentDepth: number = 5,
+  siblingCount: number = 2,
+  descendantDepth: number = 2
+): Promise<string> {
+
+  return await locator.evaluate(
+    (
+      el,
+      {
+        parentDepth,
+        siblingCount,
+        descendantDepth
+      }
+    ) => {
+
+      function cleanHTML(
+        node: Element
+      ): string {
+
+        return node.outerHTML
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      function getAncestors(
+        element: Element,
+        depth: number
+      ): string[] {
+
+        const ancestors: string[] = [];
+
+        let current =
+          element.parentElement;
+
+        while (
+          current &&
+          depth > 0
+        ) {
+
+          ancestors.push(
+            cleanHTML(current)
+          );
+
+          current =
+            current.parentElement;
+
+          depth--;
+        }
+
+        return ancestors;
+      }
+
+      function getSiblings(
+        element: Element,
+        count: number
+      ): string[] {
+
+        const siblings: string[] = [];
+
+        let prev =
+          element.previousElementSibling;
+
+        let next =
+          element.nextElementSibling;
+
+        let added = 0;
+
+        while (
+          prev &&
+          added < count
+        ) {
+
+          siblings.push(
+            cleanHTML(prev)
+          );
+
+          prev =
+            prev.previousElementSibling;
+
+          added++;
+        }
+
+        added = 0;
+
+        while (
+          next &&
+          added < count
+        ) {
+
+          siblings.push(
+            cleanHTML(next)
+          );
+
+          next =
+            next.nextElementSibling;
+
+          added++;
+        }
+
+        return siblings;
+      }
+
+      function getDescendants(
+        element: Element,
+        depth: number
+      ): string[] {
+
+        const results: string[] = [];
+
+        function walk(
+          node: Element,
+          currentDepth: number
+        ) {
+
+          if (
+            currentDepth > depth
+          ) {
+            return;
+          }
+
+          for (
+            const child of
+            Array.from(
+              node.children
+            )
+          ) {
+
+            results.push(
+              cleanHTML(child)
+            );
+
+            walk(
+              child as Element,
+              currentDepth + 1
+            );
+          }
+        }
+
+        walk(element, 1);
+
+        return results;
+      }
+
+      const target =
+        cleanHTML(el);
+
+      const ancestors =
+        getAncestors(
+          el,
+          parentDepth
+        );
+
+      const siblings =
+        getSiblings(
+          el,
+          siblingCount
+        );
+
+      const descendants =
+        getDescendants(
+          el,
+          descendantDepth
+        );
+
+      return `
+TARGET:
+${target}
+
+ANCESTORS:
+${ancestors.join('\n')}
+
+SIBLINGS:
+${siblings.join('\n')}
+
+DESCENDANTS:
+${descendants.join('\n')}
+      `.trim();
+    },
+    {
+      parentDepth,
+      siblingCount,
+      descendantDepth
+    }
+  );
+}
