@@ -1,1 +1,9 @@
 tar -a -c -f framework.zip --exclude=node_modules --exclude=.git --exclude=test-results --exclude=playwright-report --exclude=allure-results --exclude=allure-report --exclude=*.png --exclude=*.jpg --exclude=*.jpeg --exclude=*.webm *
+
+
+
+
+
+
+
+tar -a -c -f framework.zip --exclude=node_modules --exclude=.git --exclude=test-results --exclude=playwright-report --exclude=allure-results --exclude=allure-report --exclude=*.png --exclude=*.jpg --exclude=*.jpeg --exclude=*.webm --exclude=*.zip --exclude=*.mp4 --exclude=*.trace --exclude=traces --exclude=screenshots --exclude=videos *
