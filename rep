@@ -1,944 +1,716 @@
-import { test, expect, Page, Locator } from '@playwright/test';
-import { allure } from 'allure-playwright';
-import { saveElement, getElement } from '../core/db/elementRepo';
-import { findWithFallback, buildLocator, isValidLocator } from '../core/healing/fallBackEngine';
-import {
-    buildSmartLocatorBundle,
-    captureElementScreenshot,
-    captureFullPageScreenshot,
-    getElementOuterHTML,
-    getMinimalFullDOM,
-} from '../utils/selfHealing';
-
-
-const PACE = {
-    micro: 500,
-    short: 1000,
-    medium: 1500
-};
-
-async function settle(page: Page, ms = PACE.short) {
-    await page.waitForTimeout(ms);
-}
-
-async function firstVisible(
-    page: Page,
-    candidates: Locator[],
-    timeout = 8000
-): Promise<Locator> {
-
-    const deadline = Date.now() + timeout;
-
-    while (Date.now() < deadline) {
-
-        for (const c of candidates) {
-            try {
-
-                if (await c.first().isVisible()) {
-                    return c.first();
-                }
-
-            } catch { }
-        }
-
-        await page.waitForTimeout(250);
-    }
-
-    return candidates[0].first();
-}
-
-async function captureElement(
-    page: Page,
-    elementName: string,
-    locator: Locator,
-    primaryLocatorStr: string
-) {
-
-    try {
-
-        await locator.waitFor({
-            state: 'visible',
-            timeout: 8000
-        });
-
-        const bundle =
-            await buildSmartLocatorBundle(
-                locator,
-                elementName
-            );
-
-        const [
-            elementShot,
-            fullPageShot,
-            outerHTML,
-            contextDom
-        ] = await Promise.all([
-            captureElementScreenshot(locator).catch(() => null),
-            captureFullPageScreenshot(page).catch(() => null),
-            getElementOuterHTML(locator).catch(() => ''),
-            getMinimalFullDOM(page).catch(() => '')
-        ]);
-
-        await saveElement({
-            elementName,
-            pageUrl: page.url(),
-            primaryLocator: primaryLocatorStr,
-            smartLocators: bundle.smartLocators,
-            meta: bundle.meta,
-            outerHTML,
-            context_dom: contextDom,
-            elementScreenshot: elementShot,
-            fullPageScreenshot: fullPageShot
-        });
-
-
-        allure.attachment(
-            'Smart Locators',
-            JSON.stringify(
-                bundle.smartLocators,
-                null,
-                2
-            ),
-            'application/json'
-        );
-
-        allure.attachment(
-            'Element Metadata',
-            JSON.stringify(
-                bundle.meta,
-                null,
-                2
-            ),
-            'application/json'
-        );
-
-        allure.attachment(
-            'Outer HTML',
-            outerHTML,
-            'text/html'
-        );
-        if (elementShot) {
-            allure.attachment(
-                'Element Screenshot',
-                Buffer.from(
-                    elementShot,
-                    'base64'
-                ),
-                'image/jpeg'
-            );
-        }
-
-        if (fullPageShot) {
-            allure.attachment(
-                'Full Page Screenshot',
-                Buffer.from(
-                    fullPageShot,
-                    'base64'
-                ),
-                'image/jpeg'
-            );
-        }
-        console.log(`captured: ${elementName}`);
-
-    } catch (err: any) {
-
-        console.log(
-            `capture failed: ${elementName}`
-        );
-    }
-}
-
-async function resolveFromDB(
-    page: Page,
-    elementName: string
-) {
-
-    const row =
-        await getElement(elementName);
-
-    if (!row) return null;
-
-    if (row.primary_locator) {
-
-        const primary =
-            buildLocator(
-                page,
-                row.primary_locator
-            );
-
-        if (
-            primary &&
-            await isValidLocator(primary)
-        ) {
-            return {
-                locator: primary,
-                strategy: 'db-primary'
-            };
-        }
-    }
-
-
-    const smart =
-        typeof row.smart_locators === 'string'
-            ? JSON.parse(row.smart_locators)
-            : row.smart_locators;
-
-    console.log(
-        'SMART LOCATORS:',
-        JSON.stringify(smart, null, 2)
-    );
-
-    const priority = [
-        'role',
-        'testId',
-        'label',
-        'placeholder',
-        'text',
-        'alt',
-        'title',
-        'css',
-        'xpath'
-    ];
-
-    for (const key of priority) {
-
-        const locStr = smart?.[key];
-
-        if (!locStr) continue;
-
-        const built =
-            buildLocator(page, locStr);
-
-        if (built) {
-
-            const valid =
-                await isValidLocator(built);
-
-            console.log(
-                `[Smart Locator] ${key} = ${locStr}`
-            );
-
-            console.log(
-                `[Valid] ${valid}`
-            );
-
-            if (valid) {
-
-                console.log(
-                    `[Smart Locator Success] ${key}`
-                );
-
-                return {
-                    locator: built,
-                    strategy: key
-                };
-            }
-        }
-    }
-
-    return null;
-
-}
-import {
-  beginFlow,
-  logStep,
-  endFlow
-} from "../src/reporting/flowTracker";
-
-
-
-async function step(
-    page: Page,
-    elementName: string,
-    captureCandidates: Locator[],
-    primaryLocator: string,
-    action: (loc: Locator) => Promise<void>,
-    label: string
-) {
-
-    beginFlow(
-   elementName,
-   test.info().title,
-   page.url()
-);
-    await test.step(label, async () => {
-
-        const existing = await getElement(elementName);
-
-        //
-        // NEW ELEMENT
-        //
-        if (!existing) {
-
-            await test.step(
-                'Baseline Capture',
-                async () => {
-
-                    const el =
-                        await firstVisible(
-                            page,
-                            captureCandidates
-                        );
-
-                    await captureElement(
-                        page,
-                        elementName,
-                        el,
-                        primaryLocator
-                    );
-
-                    await action(el);
-                    logStep({
-    tier: "db",
-    action: "Primary Locator",
-    locator: primaryLocator,
-    status: "success"
-});
-
-endFlow({
-    finalTier: "db",
-    finalLocator: primaryLocator,
-    healed: false,
-    writtenBack: false
-});
-
-                }
-            );
-
-            return;
-        }
-
-        //
-        // DB / SMART LOCATOR
-        //
-        await test.step(
-            'Locator Resolution',
-            async () => {
-
-                const resolved =
-                    await resolveFromDB(
-                        page,
-                        elementName
-                    );
-if (resolved) {
-
-   const tier =
-      resolved.strategy === 'db-primary'
-         ? 'db'
-         : 'smart';
-
-   logStep({
-      tier,
-      action: resolved.strategy,
-      locator: resolved.locator.toString(),
-      status: 'success'
-   });
-
-   await resolved.locator.scrollIntoViewIfNeeded();
-
-   await action(resolved.locator);
-
-   endFlow({
-      finalTier: tier,
-      finalLocator: resolved.locator.toString(),
-      healed: false,
-      writtenBack: false
-   });
-
-   throw { success: true };
-}
-
-throw new Error('Locator resolution failed');
-        });
-
-    }).catch(async (e) => {
-
-    logStep({
-       tier: 'db',
-       action: 'Locator Resolution',
-       status: 'failed'
-    });
-
-    if (e?.success) {
-        return;
-    }
-
-        //
-        // AI HEALING
-        //
-        await test.step(
-            `${elementName} - AI Healing`,
-            async () => {
-
-                let healed: any;
-
-                await test.step(
-                    'Generate AI Locator',
-                    async () => {
-
-                        healed =
-                            await findWithFallback(
-                                page,
-                                elementName,
-                                page.locator('body'),
-                                'ann-taylor page'
-                            );
-
-                        allure.attachment(
-                            'Healing Result',
-                            JSON.stringify(
-                                {
-                                    element: elementName,
-                                    strategy:
-                                        healed.strategy ?? 'AI'
-                                },
-                                null,
-                                2
-                            ),
-                            'application/json'
-                        );
-                    }
-                );
-
-                await test.step(
-                    'Validate AI Locator',
-                    async () => {
-
-                        if (
-                            !(await isValidLocator(
-                                healed.locator
-                            ))
-                        ) {
-                            throw new Error(
-                                `Could not heal ${elementName}`
-                            );
-                        }
-
-                    }
-                );
-
-                await test.step(
-                    'Execute Healed Action',
-                    async () => {
-
-                        await healed.locator.scrollIntoViewIfNeeded();
-
-                        await action(
-                            healed.locator
-                        );
-                        logStep({
-   tier: 'ai',
-   action: 'AI Healing',
-   locator: healed.locator.toString(),
-   status: 'success'
-});
-
-endFlow({
-   finalTier: 'ai',
-   finalLocator: healed.locator.toString(),
-   healed: true,
-   writtenBack: true
-});
-
-                    }
-                );
-            }
-        );
-    });
-}
-test.describe(
-    'Ann taylor Homepage',
-    () => {
-
-        test(
-            'homepage interactions',
-            async ({ page }) => {
-
-                await page.goto(
-                    'https://sfqa.anntaylor.com/',
-                    {
-                        waitUntil: 'domcontentloaded'
-                    }
-                
-                );
-                await page.waitForTimeout(5000);
-
-                await step(
-                    page,
-                    'continue_shopping',
-                    [
-                        page.locator('#continueButton'),
-                        page.locator('.cookie-content #continueButton'),
-                        page.getByRole('button', {
-                            name: /continue shopping/i
-                        })
-                    ],
-                    '#continueButton',
-                    async loc => {
-
-                        await loc.click();
-
-                        await page.waitForTimeout(3000);
-
-                    },
-                    'Continue Shopping'
-                );
-
-                //
-                // Scroll homepage
-                //
-                await page.mouse.wheel(0, 800);
-
-                await page.waitForTimeout(2000);
-
-                //
-                // Shades Of The Season
-                //
-                await step(
-                    page,
-                    'shades_of_the_season',
-                    [
-                        page.getByRole('link', {
-                            name: /shades of the season/i
-                        }),
-                        page.getByText(/shades of the season/i)
-                    ],
-                    'shades of the season',
-                    async loc => {
-
-                        await loc.click();
-
-                        await page.waitForLoadState('domcontentloaded');
-
-                        await page.waitForTimeout(3000);
-
-                    },
-                    'Open Shades Of The Season'
-                );
-
-                //
-                // Scroll PLP
-                //
-                await page.mouse.wheel(0, 1200);
-
-                await page.waitForTimeout(2000);
-
-                //
-                // First Dress
-                //
-                await step(
-                    page,
-                    'dress_product',
-                    [
-                        page.locator('[data-testid*="product"]').first(),
-                        page.locator('.product-tile a').first(),
-                        page.locator('a[href*="/p/"]').first()
-                    ],
-                    'first dress',
-                    async loc => {
-
-                        await loc.click();
-
-                        await page.waitForLoadState('domcontentloaded');
-
-                        await page.waitForTimeout(3000);
-
-                    },
-                    'Open Dress Product'
-                );
-
-                //
-                // Size Selection
-                //
-
-
-                await step(
-                    page,
-                    'dress_size',
-                    [
-                        page.getByRole('button', { name: /^XS\/S$/i, disabled: false }),
-                        page.getByRole('button', { name: /^M$/i, disabled: false }),
-                        page.getByRole('button', { name: /^L$/i, disabled: false })
-                    ],
-                    'dress size',
-                    async loc => {
-
-                        await loc.click();
-
-                        await page.waitForTimeout(1500);
-
-                    },
-                    'Select Dress Size'
-                );
-
-                //
-                // Add To Bag
-                //
-               //
-// Add To Bag
-//
-await step(
-    page,
-    'add_to_bag',
-   [
-    page.locator('#addToCart'),
-    page.getByRole('button', { name: /add to bag/i }),
-    page.getByText(/add to bag/i)
-],
-    'add to bag',
-    async loc => {
-
-        await loc.click();
-
-        await page.waitForTimeout(3000);
-
-    },
-    'Add To Bag'
-);
-
-//
-// Verify Item Added To Bag
-//
-await test.step(
-    'Verify Item Added To Bag',
-    async () => {
-
-        await expect(
-            page.locator('body')
-        ).toContainText(
-            /bag|cart|added/i
-        );
-
-    }
-);
-            }
-        );
-    }
-);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import fs from "fs";
-import path from "path";
-import { HealFlow } from "./types";
-
-const tierColor = { db: "#16a34a", smart: "#d97706", ai: "#dc2626" } as const;
-const statusIcon = { success: "\u2713", failed: "\u2717", skipped: "\u2013" } as const;
-
-const esc = (s?: string | number | null) =>
-  String(s ?? "\u2014")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-
-export function renderHtml(flows: HealFlow[], outDir: string): string {
-  console.log(
-  "REPORT FLOWS:",
-  JSON.stringify(flows, null, 2)
-);
-
-
-const rows = flows.map(f => `
-<tr>
-  <td>${esc(f.elementName)}</td>
-  <td>${esc(f.testName)}</td>
-
-  <td>
-    <span class="tier ${f.finalTier ?? "unresolved"}">
-      ${f.finalTier?.toUpperCase() ?? "UNRESOLVED"}
-    </span>
-  </td>
-
-  <td>${f.healed ? "Yes" : "No"}</td>
-
-  <td>${f.writtenBack ? "Yes" : "No"}</td>
-
-  <td>${esc(f.finalLocator)}</td>
-</tr>
-
-<tr class="details">
-  <td colspan="6">
-
-    <table class="steps">
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>Tier</th>
-          <th>Action</th>
-          <th>Status</th>
-          <th>Locator</th>
-          <th>Duration</th>
-        </tr>
-      </thead>
-
-      <tbody>
-
-      ${f.steps.map(s => `
-        <tr>
-          <td>${s.order}</td>
-          <td>${s.tier}</td>
-          <td>${esc(s.action)}</td>
-          <td>${s.status}</td>
-          <td>${esc(s.locator)}</td>
-          <td>${s.durationMs ?? "-"}</td>
-        </tr>
-      `).join("")}
-
-      </tbody>
-
-    </table>
-
-  </td>
-</tr>
-`).join("");
-
-  const c = (t: string) => flows.filter((f) => f.finalTier === t).length;
-  const unresolved = flows.filter((f) => !f.finalTier).length;
-
-  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Self-Healing Flow Report</title>
+<title>Knitwell · Self-Healing Flow Report</title>
 <style>
- body{
-    margin:0;
-    background:#f4f7fb;
-    font-family:'Segoe UI',sans-serif;
-    color:#1e293b;
-    padding:30px;
-}
+  :root{
+    --bg:#0B1220; --panel:#111B2E; --panel-2:#0E1626; --line:#1E2B45;
+    --ink:#E8EEF7; --muted:#8DA0BF; --faint:#5C6E8C;
+    --db:#2DD4A7; --smart:#F4B740; --ai:#FF6B6B; --unres:#6B7A99;
+    --accent:#5B8DEF;
+    --mono:'JetBrains Mono','SF Mono',ui-monospace,Menlo,Consolas,monospace;
+    --sans:'Inter','Segoe UI',system-ui,-apple-system,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:
+    radial-gradient(1200px 600px at 85% -10%,#16243f 0%,transparent 55%),
+    var(--bg);
+    color:var(--ink);font-family:var(--sans);
+    -webkit-font-smoothing:antialiased;padding:34px 30px 60px;line-height:1.5}
 
-.header{
-    margin-bottom:30px;
-}
+  .topbar{display:flex;align-items:flex-end;justify-content:space-between;
+    flex-wrap:wrap;gap:16px;margin-bottom:30px}
+  .brand{display:flex;flex-direction:column;gap:6px}
+  .brand .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.32em;
+    color:var(--db);text-transform:uppercase}
+  .brand h1{margin:0;font-size:30px;font-weight:700;letter-spacing:-.01em}
+  .brand .sub{color:var(--muted);font-size:14px}
+  .gen{font-family:var(--mono);font-size:12px;color:var(--faint);text-align:right}
 
-.header h1{
-    margin:0;
-    font-size:28px;
-    font-weight:700;
-}
+  /* Hero score */
+  .hero{display:grid;grid-template-columns:280px 1fr;gap:22px;margin-bottom:22px}
+  @media(max-width:860px){.hero{grid-template-columns:1fr}}
+  .score{background:linear-gradient(160deg,var(--panel),var(--panel-2));
+    border:1px solid var(--line);border-radius:18px;padding:26px;
+    display:flex;flex-direction:column;justify-content:center;align-items:center;
+    position:relative;overflow:hidden}
+  .ring{position:relative;width:180px;height:180px}
+  .ring svg{transform:rotate(-90deg)}
+  .ring .val{position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center}
+  .ring .num{font-size:46px;font-weight:700;letter-spacing:-.02em}
+  .ring .num small{font-size:20px;color:var(--muted)}
+  .ring .cap{font-family:var(--mono);font-size:11px;letter-spacing:.18em;
+    color:var(--muted);text-transform:uppercase;margin-top:2px}
 
-.header p{
-    color:#64748b;
-}
+  .dist{background:linear-gradient(160deg,var(--panel),var(--panel-2));
+    border:1px solid var(--line);border-radius:18px;padding:24px 26px;
+    display:flex;flex-direction:column;gap:18px}
+  .dist h3{margin:0;font-size:13px;font-family:var(--mono);letter-spacing:.16em;
+    text-transform:uppercase;color:var(--muted);font-weight:600}
+  .bar{display:flex;height:46px;border-radius:11px;overflow:hidden;
+    background:#0a0f1c;border:1px solid var(--line)}
+  .bar .seg{display:flex;align-items:center;justify-content:center;
+    color:#06121b;font-weight:700;font-size:13px;transition:width .6s ease;min-width:2px}
+  .bar .seg span{padding:0 4px}
+  .legend{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:20px}
+  .legend li{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+  .legend b{color:var(--ink);font-size:15px;margin-left:2px}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
 
-.summary{
-    display:grid;
-    grid-template-columns:repeat(5,1fr);
-    gap:20px;
-    margin-bottom:30px;
-}
+  /* Stat cards */
+  .stats{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:26px}
+  @media(max-width:1100px){.stats{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:18px 18px 16px}
+  .stat .v{font-size:30px;font-weight:700;letter-spacing:-.02em;line-height:1}
+  .stat .l{color:var(--muted);font-size:12.5px;margin-top:8px}
+  .stat.accent .v{color:var(--db)}
 
-.card{
-    background:#fff;
-    border-radius:12px;
-    padding:20px;
-    box-shadow:0 2px 12px rgba(0,0,0,.08);
-}
+  /* Timeline */
+  .section-h{font-family:var(--mono);font-size:12px;letter-spacing:.2em;
+    text-transform:uppercase;color:var(--muted);margin:30px 0 14px}
+  .timeline{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:8px}
+  .tl-chip{display:flex;align-items:center;gap:9px;background:var(--panel);
+    border:1px solid var(--line);border-left:3px solid var(--c);
+    border-radius:9px;padding:9px 13px;font-size:13px}
+  .tl-tier{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;
+    color:var(--c);text-transform:uppercase;font-weight:600}
+  .tl-name{color:var(--ink);font-weight:500}
+  .tl-wb{font-size:11px;color:var(--db);font-family:var(--mono)}
 
-.value{
-    font-size:32px;
-    font-weight:700;
-}
+  /* Table */
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;
+    overflow:hidden}
+  table.main-t{width:100%;border-collapse:collapse}
+  table.main-t thead th{background:#0c1424;color:var(--muted);text-align:left;
+    padding:14px 16px;font-size:11.5px;font-family:var(--mono);letter-spacing:.1em;
+    text-transform:uppercase;font-weight:600;border-bottom:1px solid var(--line)}
+  table.main-t td{padding:13px 16px;border-bottom:1px solid var(--line);font-size:13.5px;
+    vertical-align:middle}
+  tr.main{cursor:pointer;transition:background .15s}
+  tr.main:hover{background:#0f1a2e}
+  td.ix{font-family:var(--mono);color:var(--faint);font-size:12px}
+  td.el{font-weight:600}
+  td.tc{color:var(--muted);font-size:12.5px}
+  td.loc{font-family:var(--mono);font-size:11.5px;color:var(--muted);
+    max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  td.exp{color:var(--faint);text-align:center;width:30px;transition:transform .2s}
+  tr.main.open td.exp{transform:rotate(180deg);color:var(--accent)}
+  .tier{padding:5px 11px;border-radius:20px;font-size:11.5px;font-weight:700;
+    font-family:var(--mono);letter-spacing:.04em;white-space:nowrap}
+  .yes{color:var(--db);font-weight:600;font-size:12.5px}
+  .no{color:var(--faint)}
 
-.label{
-    color:#64748b;
-    margin-top:6px;
-}
+  tr.detail{display:none}
+  tr.detail.show{display:table-row}
+  tr.detail td{background:var(--panel-2);padding:0 16px 14px}
+  table.steps{width:100%;border-collapse:collapse;margin:6px 0 4px}
+  table.steps th{background:transparent;color:var(--faint);text-align:left;
+    padding:9px 12px;font-size:10.5px;font-family:var(--mono);letter-spacing:.08em;
+    text-transform:uppercase;border-bottom:1px solid var(--line)}
+  table.steps td{padding:9px 12px;font-size:12px;border-bottom:1px solid #16223a}
+  .mini{font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:5px;
+    text-transform:uppercase;letter-spacing:.05em;font-weight:700}
+  .mini.db{background:#2DD4A722;color:var(--db)}
+  .mini.smart{background:#F4B74022;color:var(--smart)}
+  .mini.ai{background:#FF6B6B22;color:var(--ai)}
+  .st-success{color:var(--db)} .st-failed{color:var(--ai)} .st-skipped{color:var(--faint)}
+  .empty{color:var(--faint);text-align:center;padding:14px}
 
-table{
-    width:100%;
-    border-collapse:collapse;
-    background:#fff;
-    border-radius:12px;
-    overflow:hidden;
-    box-shadow:0 2px 12px rgba(0,0,0,.08);
-}
-
-th{
-    background:#0f172a;
-    color:#fff;
-    text-align:left;
-    padding:14px;
-}
-
-td{
-    padding:14px;
-    border-bottom:1px solid #e2e8f0;
-}
-
-tbody tr:hover{
-    background:#f8fafc;
-}
-
-.tier{
-    padding:6px 12px;
-    border-radius:20px;
-    font-size:12px;
-    font-weight:600;
-}
-
-.tier.db{
-    background:#dcfce7;
-    color:#166534;
-}
-
-.tier.smart{
-    background:#fef3c7;
-    color:#92400e;
-}
-
-.tier.ai{
-    background:#fee2e2;
-    color:#991b1b;
-}
-
-.tier.unresolved{
-    background:#e5e7eb;
-    color:#374151;
-}
-
-.details{
-    background:#fafafa;
-}
-
-.steps{
-    width:100%;
-    margin-top:10px;
-}
-
-.steps th{
-    background:#334155;
-    color:#fff;
-    font-size:12px;
-}
-
-.steps td{
-    font-size:12px;
-}
+  .foot{margin-top:26px;color:var(--faint);font-size:12px;font-family:var(--mono);
+    text-align:center;letter-spacing:.04em}
 </style></head><body>
-<div class="header">
-  <h1>Self-Healing Automation Dashboard</h1>
-  <p>
-    Generated ${new Date().toLocaleString()}
-  </p>
-</div>
 
-<div class="summary">
-
-  <div class="card">
-    <div class="value">${flows.length}</div>
-    <div class="label">Total Elements</div>
+  <div class="topbar">
+    <div class="brand">
+      <span class="kicker">Knitwell · Self-Healing</span>
+      <h1>Flow Resolution Dashboard</h1>
+      <span class="sub">Live results from the three-tier fallback chain — DB primary → smart locators → AI healing</span>
+    </div>
+    <div class="gen">Generated<br>6/15/2026, 6:55:01 PM</div>
   </div>
 
-  <div class="card">
-    <div class="value">${c("db")}</div>
-    <div class="label">DB Resolved</div>
+  <div class="hero">
+    <div class="score">
+      <div class="ring">
+        <svg width="180" height="180" viewBox="0 0 180 180">
+          <circle cx="90" cy="90" r="78" fill="none" stroke="#1a2740" stroke-width="14"/>
+          <circle cx="90" cy="90" r="78" fill="none" stroke="url(#g)" stroke-width="14"
+            stroke-linecap="round" stroke-dasharray="490 490"/>
+          <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#2DD4A7"/><stop offset="1" stop-color="#5B8DEF"/>
+          </linearGradient></defs>
+        </svg>
+        <div class="val">
+          <div class="num">100<small>%</small></div>
+          <div class="cap">Resilience</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="dist">
+      <h3>Tier Distribution · 15 elements</h3>
+      <div class="bar"><div class="seg" style="width:33.3%;background:#2DD4A7" title="DB Primary: 5"><span>5</span></div><div class="seg" style="width:40%;background:#F4B740" title="Smart Locator: 6"><span>6</span></div><div class="seg" style="width:26.7%;background:#FF6B6B" title="AI Healed: 4"><span>4</span></div></div>
+      <ul class="legend"><li><span class="dot" style="background:#2DD4A7"></span>DB Primary<b>5</b></li><li><span class="dot" style="background:#F4B740"></span>Smart Locator<b>6</b></li><li><span class="dot" style="background:#FF6B6B"></span>AI Healed<b>4</b></li><li><span class="dot" style="background:#6B7A99"></span>Unresolved<b>0</b></li></ul>
+    </div>
   </div>
 
-  <div class="card">
-    <div class="value">${c("smart")}</div>
-    <div class="label">Smart Healed</div>
+  <div class="stats">
+    <div class="stat"><div class="v">15</div><div class="l">Total Elements</div></div>
+    <div class="stat accent"><div class="v">5</div><div class="l">DB Resolved</div></div>
+    <div class="stat"><div class="v">6</div><div class="l">Smart Healed</div></div>
+    <div class="stat"><div class="v">4</div><div class="l">AI Healed</div></div>
+    <div class="stat"><div class="v">4</div><div class="l">Written Back</div></div>
+    <div class="stat"><div class="v">1.9</div><div class="l">Avg Steps / Element</div></div>
   </div>
 
-  <div class="card">
-    <div class="value">${c("ai")}</div>
-    <div class="label">AI Healed</div>
+  <div class="section-h">Resolution Timeline</div>
+  <div class="timeline"><div class="tl-chip" style="--c:#2DD4A7">
+        <span class="tl-tier">DB Primary</span>
+        <span class="tl-name">continue_shopping</span>
+        
+      </div><div class="tl-chip" style="--c:#2DD4A7">
+        <span class="tl-tier">DB Primary</span>
+        <span class="tl-name">search_toggle</span>
+        
+      </div><div class="tl-chip" style="--c:#F4B740">
+        <span class="tl-tier">Smart Locator</span>
+        <span class="tl-name">shades_of_the_season</span>
+        
+      </div><div class="tl-chip" style="--c:#F4B740">
+        <span class="tl-tier">Smart Locator</span>
+        <span class="tl-name">newsletter_signup</span>
+        
+      </div><div class="tl-chip" style="--c:#F4B740">
+        <span class="tl-tier">Smart Locator</span>
+        <span class="tl-name">dress_product</span>
+        
+      </div><div class="tl-chip" style="--c:#FF6B6B">
+        <span class="tl-tier">AI Healed</span>
+        <span class="tl-name">dress_size</span>
+        <span class="tl-wb" title="Promoted back to locator store">↩ written back</span>
+      </div><div class="tl-chip" style="--c:#FF6B6B">
+        <span class="tl-tier">AI Healed</span>
+        <span class="tl-name">color_swatch</span>
+        <span class="tl-wb" title="Promoted back to locator store">↩ written back</span>
+      </div><div class="tl-chip" style="--c:#2DD4A7">
+        <span class="tl-tier">DB Primary</span>
+        <span class="tl-name">add_to_bag</span>
+        
+      </div><div class="tl-chip" style="--c:#F4B740">
+        <span class="tl-tier">Smart Locator</span>
+        <span class="tl-name">mini_cart_open</span>
+        
+      </div><div class="tl-chip" style="--c:#FF6B6B">
+        <span class="tl-tier">AI Healed</span>
+        <span class="tl-name">promo_code_field</span>
+        <span class="tl-wb" title="Promoted back to locator store">↩ written back</span>
+      </div><div class="tl-chip" style="--c:#2DD4A7">
+        <span class="tl-tier">DB Primary</span>
+        <span class="tl-name">checkout_button</span>
+        
+      </div><div class="tl-chip" style="--c:#F4B740">
+        <span class="tl-tier">Smart Locator</span>
+        <span class="tl-name">guest_checkout</span>
+        
+      </div><div class="tl-chip" style="--c:#2DD4A7">
+        <span class="tl-tier">DB Primary</span>
+        <span class="tl-name">shipping_zip</span>
+        
+      </div><div class="tl-chip" style="--c:#FF6B6B">
+        <span class="tl-tier">AI Healed</span>
+        <span class="tl-name">delivery_option</span>
+        <span class="tl-wb" title="Promoted back to locator store">↩ written back</span>
+      </div><div class="tl-chip" style="--c:#F4B740">
+        <span class="tl-tier">Smart Locator</span>
+        <span class="tl-name">place_order</span>
+        
+      </div></div>
+
+  <div class="section-h">Element Detail · click a row to expand its tier trace</div>
+  <div class="panel">
+    <table class="main-t">
+      <thead><tr>
+        <th>#</th><th>Element</th><th>Test Case</th><th>Final Tier</th>
+        <th>Healed</th><th>Write-Back</th><th>Final Locator</th><th></th>
+      </tr></thead>
+      <tbody><tr class="main" data-row="0">
+        <td class="ix">01</td>
+        <td class="el">continue_shopping</td>
+        <td class="tc">homepage interactions</td>
+        <td><span class="tier" style="background:#2DD4A71f;color:#2DD4A7">DB Primary</span></td>
+        <td><span class="no">—</span></td>
+        <td><span class="no">—</span></td>
+        <td class="loc">#continueButton</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="0">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-success">success</td>
+        <td class="loc">#continueButton</td>
+        <td>142 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="1">
+        <td class="ix">02</td>
+        <td class="el">search_toggle</td>
+        <td class="tc">homepage interactions</td>
+        <td><span class="tier" style="background:#2DD4A71f;color:#2DD4A7">DB Primary</span></td>
+        <td><span class="no">—</span></td>
+        <td><span class="no">—</span></td>
+        <td class="loc">[data-testid='search-icon']</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="1">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-success">success</td>
+        <td class="loc">[data-testid='search-icon']</td>
+        <td>98 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="2">
+        <td class="ix">03</td>
+        <td class="el">shades_of_the_season</td>
+        <td class="tc">homepage interactions</td>
+        <td><span class="tier" style="background:#F4B7401f;color:#F4B740">Smart Locator</span></td>
+        <td><span class="no">—</span></td>
+        <td><span class="no">—</span></td>
+        <td class="loc">getByRole('link', { name: /shades of the season/i })</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="2">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">a.promo-shades</td>
+        <td>210 ms</td>
+      </tr><tr>
+        <td>2</td>
+        <td><span class="mini smart">smart</span></td>
+        <td>role</td>
+        <td class="st-success">success</td>
+        <td class="loc">getByRole('link', { name: /shades of the season/i })</td>
+        <td>156 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="3">
+        <td class="ix">04</td>
+        <td class="el">newsletter_signup</td>
+        <td class="tc">homepage interactions</td>
+        <td><span class="tier" style="background:#F4B7401f;color:#F4B740">Smart Locator</span></td>
+        <td><span class="no">—</span></td>
+        <td><span class="no">—</span></td>
+        <td class="loc">getByPlaceholder('Email Address')</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="3">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">#emailSignup</td>
+        <td>188 ms</td>
+      </tr><tr>
+        <td>2</td>
+        <td><span class="mini smart">smart</span></td>
+        <td>placeholder</td>
+        <td class="st-success">success</td>
+        <td class="loc">getByPlaceholder('Email Address')</td>
+        <td>121 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="4">
+        <td class="ix">05</td>
+        <td class="el">dress_product</td>
+        <td class="tc">homepage interactions</td>
+        <td><span class="tier" style="background:#F4B7401f;color:#F4B740">Smart Locator</span></td>
+        <td><span class="no">—</span></td>
+        <td><span class="no">—</span></td>
+        <td class="loc">.product-tile a &gt;&gt; nth=0</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="4">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">[data-testid*='product']</td>
+        <td>240 ms</td>
+      </tr><tr>
+        <td>2</td>
+        <td><span class="mini smart">smart</span></td>
+        <td>css</td>
+        <td class="st-success">success</td>
+        <td class="loc">.product-tile a &gt;&gt; nth=0</td>
+        <td>174 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="5">
+        <td class="ix">06</td>
+        <td class="el">dress_size</td>
+        <td class="tc">homepage interactions</td>
+        <td><span class="tier" style="background:#FF6B6B1f;color:#FF6B6B">AI Healed</span></td>
+        <td><span class="yes">Healed</span></td>
+        <td><span class="yes">Yes</span></td>
+        <td class="loc">getByRole('button', { name: 'M', exact: true })</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="5">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">button.size-M</td>
+        <td>198 ms</td>
+      </tr><tr>
+        <td>2</td>
+        <td><span class="mini smart">smart</span></td>
+        <td>role</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">getByRole('button', { name: /M/ })</td>
+        <td>165 ms</td>
+      </tr><tr>
+        <td>3</td>
+        <td><span class="mini ai">ai</span></td>
+        <td>AI Healing</td>
+        <td class="st-success">success</td>
+        <td class="loc">getByRole('button', { name: 'M', exact: true })</td>
+        <td>2840 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="6">
+        <td class="ix">07</td>
+        <td class="el">color_swatch</td>
+        <td class="tc">homepage interactions</td>
+        <td><span class="tier" style="background:#FF6B6B1f;color:#FF6B6B">AI Healed</span></td>
+        <td><span class="yes">Healed</span></td>
+        <td><span class="yes">Yes</span></td>
+        <td class="loc">getByLabel('Color: Navy')</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="6">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">.swatch-navy</td>
+        <td>176 ms</td>
+      </tr><tr>
+        <td>2</td>
+        <td><span class="mini smart">smart</span></td>
+        <td>label</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">getByLabel('Navy')</td>
+        <td>142 ms</td>
+      </tr><tr>
+        <td>3</td>
+        <td><span class="mini ai">ai</span></td>
+        <td>AI Healing</td>
+        <td class="st-success">success</td>
+        <td class="loc">getByLabel('Color: Navy')</td>
+        <td>3120 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="7">
+        <td class="ix">08</td>
+        <td class="el">add_to_bag</td>
+        <td class="tc">homepage interactions</td>
+        <td><span class="tier" style="background:#2DD4A71f;color:#2DD4A7">DB Primary</span></td>
+        <td><span class="no">—</span></td>
+        <td><span class="no">—</span></td>
+        <td class="loc">#addToCart</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="7">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-success">success</td>
+        <td class="loc">#addToCart</td>
+        <td>110 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="8">
+        <td class="ix">09</td>
+        <td class="el">mini_cart_open</td>
+        <td class="tc">checkout flow</td>
+        <td><span class="tier" style="background:#F4B7401f;color:#F4B740">Smart Locator</span></td>
+        <td><span class="no">—</span></td>
+        <td><span class="no">—</span></td>
+        <td class="loc">getByRole('button', { name: /view bag/i })</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="8">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">#miniCart</td>
+        <td>152 ms</td>
+      </tr><tr>
+        <td>2</td>
+        <td><span class="mini smart">smart</span></td>
+        <td>role</td>
+        <td class="st-success">success</td>
+        <td class="loc">getByRole('button', { name: /view bag/i })</td>
+        <td>133 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="9">
+        <td class="ix">10</td>
+        <td class="el">promo_code_field</td>
+        <td class="tc">checkout flow</td>
+        <td><span class="tier" style="background:#FF6B6B1f;color:#FF6B6B">AI Healed</span></td>
+        <td><span class="yes">Healed</span></td>
+        <td><span class="yes">Yes</span></td>
+        <td class="loc">getByPlaceholder('Promo or gift card')</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="9">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">#promoCode</td>
+        <td>205 ms</td>
+      </tr><tr>
+        <td>2</td>
+        <td><span class="mini smart">smart</span></td>
+        <td>placeholder</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">getByPlaceholder('Promo')</td>
+        <td>158 ms</td>
+      </tr><tr>
+        <td>3</td>
+        <td><span class="mini ai">ai</span></td>
+        <td>AI Healing</td>
+        <td class="st-success">success</td>
+        <td class="loc">getByPlaceholder('Promo or gift card')</td>
+        <td>2675 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="10">
+        <td class="ix">11</td>
+        <td class="el">checkout_button</td>
+        <td class="tc">checkout flow</td>
+        <td><span class="tier" style="background:#2DD4A71f;color:#2DD4A7">DB Primary</span></td>
+        <td><span class="no">—</span></td>
+        <td><span class="no">—</span></td>
+        <td class="loc">[data-testid='checkout-cta']</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="10">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-success">success</td>
+        <td class="loc">[data-testid='checkout-cta']</td>
+        <td>119 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="11">
+        <td class="ix">12</td>
+        <td class="el">guest_checkout</td>
+        <td class="tc">checkout flow</td>
+        <td><span class="tier" style="background:#F4B7401f;color:#F4B740">Smart Locator</span></td>
+        <td><span class="no">—</span></td>
+        <td><span class="no">—</span></td>
+        <td class="loc">getByText(/continue as guest/i)</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="11">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">.guest-btn</td>
+        <td>167 ms</td>
+      </tr><tr>
+        <td>2</td>
+        <td><span class="mini smart">smart</span></td>
+        <td>text</td>
+        <td class="st-success">success</td>
+        <td class="loc">getByText(/continue as guest/i)</td>
+        <td>144 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="12">
+        <td class="ix">13</td>
+        <td class="el">shipping_zip</td>
+        <td class="tc">checkout flow</td>
+        <td><span class="tier" style="background:#2DD4A71f;color:#2DD4A7">DB Primary</span></td>
+        <td><span class="no">—</span></td>
+        <td><span class="no">—</span></td>
+        <td class="loc">#shippingZip</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="12">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-success">success</td>
+        <td class="loc">#shippingZip</td>
+        <td>102 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="13">
+        <td class="ix">14</td>
+        <td class="el">delivery_option</td>
+        <td class="tc">checkout flow</td>
+        <td><span class="tier" style="background:#FF6B6B1f;color:#FF6B6B">AI Healed</span></td>
+        <td><span class="yes">Healed</span></td>
+        <td><span class="yes">Yes</span></td>
+        <td class="loc">getByRole('radio', { name: /standard.*free/i })</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="13">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">#deliveryStandard</td>
+        <td>188 ms</td>
+      </tr><tr>
+        <td>2</td>
+        <td><span class="mini smart">smart</span></td>
+        <td>role</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">getByRole('radio', { name: /standard/i })</td>
+        <td>171 ms</td>
+      </tr><tr>
+        <td>3</td>
+        <td><span class="mini ai">ai</span></td>
+        <td>AI Healing</td>
+        <td class="st-success">success</td>
+        <td class="loc">getByRole('radio', { name: /standard.*free/i })</td>
+        <td>2990 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr><tr class="main" data-row="14">
+        <td class="ix">15</td>
+        <td class="el">place_order</td>
+        <td class="tc">checkout flow</td>
+        <td><span class="tier" style="background:#F4B7401f;color:#F4B740">Smart Locator</span></td>
+        <td><span class="no">—</span></td>
+        <td><span class="no">—</span></td>
+        <td class="loc">getByRole('button', { name: /place order/i })</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="14">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody><tr>
+        <td>1</td>
+        <td><span class="mini db">db</span></td>
+        <td>Primary Locator</td>
+        <td class="st-failed">failed</td>
+        <td class="loc">#placeOrder</td>
+        <td>159 ms</td>
+      </tr><tr>
+        <td>2</td>
+        <td><span class="mini smart">smart</span></td>
+        <td>role</td>
+        <td class="st-success">success</td>
+        <td class="loc">getByRole('button', { name: /place order/i })</td>
+        <td>138 ms</td>
+      </tr></tbody>
+          </table>
+        </td>
+      </tr></tbody>
+    </table>
   </div>
 
-  <div class="card">
-    <div class="value">${unresolved}</div>
-    <div class="label">Unresolved</div>
+  <div class="foot">
+    15/15 resolved · 4 healed · 4 promoted to store · 15581 ms total tier time
   </div>
 
-</div>
-
-<table>
-
-<thead>
-<tr>
-<th>Element</th>
-<th>Test Case</th>
-<th>Final Tier</th>
-<th>Healed</th>
-<th>Write Back</th>
-<th>Final Locator</th>
-</tr>
-</thead>
-
-<tbody>
-${rows}
-</tbody>
-
-</table>
-</body></html>`;
-
-
-fs.writeFileSync(
- path.join(outDir,"report-data.json"),
- JSON.stringify(flows,null,2)
-);
-const out = path.join(outDir, "index.html");
-
-console.log("Dashboard created:", out);
-
-return out;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+<script>
+  document.querySelectorAll('tr.main').forEach(function(r){
+    r.addEventListener('click',function(){
+      var i=r.getAttribute('data-row');
+      var d=document.querySelector('tr.detail[data-detail="'+i+'"]');
+      if(!d)return;
+      r.classList.toggle('open');
+      d.classList.toggle('show');
+    });
+  });
+</script>
+</body></html>
