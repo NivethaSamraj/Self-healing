@@ -1,0 +1,106 @@
+import fs from "fs";
+import path from "path";
+import { HealFlow } from "./types";
+
+const tierColor = { db: "#16a34a", smart: "#d97706", ai: "#dc2626" } as const;
+const statusIcon = { success: "\u2713", failed: "\u2717", skipped: "\u2013" } as const;
+
+const esc = (s?: string | number | null) =>
+  String(s ?? "\u2014")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+export function renderHtml(flows: HealFlow[], outDir: string): string {
+  const cards = flows
+    .map((f) => {
+      const headColor = f.finalTier ? tierColor[f.finalTier] : "#64748b";
+      const steps = f.steps
+        .map(
+          (s) => `
+      <li class="step ${s.status}">
+        <span class="ord">${s.order}</span>
+        <span class="dot" style="background:${tierColor[s.tier]}"></span>
+        <div class="stepbody">
+          <div class="stephead">
+            <b>${esc(s.action)}</b>
+            <span class="st ${s.status}">${statusIcon[s.status]} ${s.status}</span>
+            ${s.confidence != null ? `<span class="conf">conf ${esc(s.confidence)}</span>` : ""}
+            ${s.durationMs != null ? `<span class="ms">${esc(s.durationMs)}ms</span>` : ""}
+          </div>
+          ${s.locator ? `<code>${esc(s.locator)}</code>` : ""}
+          ${s.reason ? `<div class="reason">${esc(s.reason)}</div>` : ""}
+        </div>
+      </li>`
+        )
+        .join("");
+
+      return `
+    <details class="card" ${f.finalTier === "ai" || !f.finalTier ? "open" : ""}>
+      <summary>
+        <span class="cbar" style="background:${headColor}"></span>
+        <span class="ckey">${esc(f.elementName)}</span>
+        <span class="cbadge" style="background:${headColor}">
+          ${f.finalTier ? f.finalTier.toUpperCase() : "UNRESOLVED"}</span>
+        ${f.healed ? '<span class="tag heal">AI HEALED</span>' : ""}
+        ${f.writtenBack ? '<span class="tag wb">WRITE-BACK</span>' : ""}
+        <span class="cnt">${f.steps.length} steps</span>
+      </summary>
+      <div class="ctest">${esc(f.testName)} \u00b7 <span class="url">${esc(f.pageUrl)}</span></div>
+      <ol class="flow">${steps}</ol>
+    </details>`;
+    })
+    .join("");
+
+  const c = (t: string) => flows.filter((f) => f.finalTier === t).length;
+  const unresolved = flows.filter((f) => !f.finalTier).length;
+
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Self-Healing Flow Report</title>
+<style>
+  body{margin:0;background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;padding:24px}
+  h1{font-size:20px;margin:0 0 4px} .sub{color:#94a3b8;font-size:13px;margin-bottom:20px}
+  .summary{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}
+  .stat{background:#1e293b;border-radius:10px;padding:12px 16px}
+  .stat b{display:block;font-size:22px} .stat span{font-size:12px;color:#94a3b8}
+  .card{background:#1e293b;border-radius:10px;margin-bottom:10px;overflow:hidden}
+  summary{display:flex;align-items:center;gap:8px;padding:12px 16px;cursor:pointer;list-style:none}
+  summary::-webkit-details-marker{display:none}
+  .cbar{width:8px;height:8px;border-radius:999px;flex:none}
+  .ckey{font-weight:600} .cnt{margin-left:auto;font-size:12px;color:#64748b}
+  .cbadge{font-size:11px;padding:2px 8px;border-radius:999px;color:#fff;font-weight:600}
+  .tag{font-size:10px;padding:2px 6px;border-radius:4px;font-weight:600}
+  .heal{background:#7f1d1d}.wb{background:#1e3a8a}
+  .ctest{padding:0 16px 8px;font-size:12px;color:#64748b}
+  .url{color:#475569}
+  .flow{list-style:none;margin:0;padding:0 16px 16px}
+  .step{display:flex;gap:10px;padding:8px 0;border-top:1px solid #334155;align-items:flex-start}
+  .ord{color:#64748b;font-size:12px;width:18px;text-align:right;padding-top:2px}
+  .dot{width:8px;height:8px;border-radius:999px;margin-top:6px;flex:none}
+  .stepbody{flex:1} .stephead{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .st{font-size:11px;padding:1px 6px;border-radius:4px}
+  .st.success{background:#14532d;color:#bbf7d0}
+  .st.failed{background:#7f1d1d;color:#fecaca}
+  .st.skipped{background:#334155;color:#cbd5e1}
+  .conf{font-size:11px;color:#93c5fd}
+  .ms{font-size:11px;color:#64748b}
+  code{display:block;font-size:12px;color:#cbd5e1;word-break:break-all;margin-top:4px}
+  .reason{font-size:12px;color:#fca5a5;margin-top:4px}
+</style></head><body>
+<h1>Self-Healing Flow Report</h1>
+<div class="sub">Generated ${new Date().toLocaleString()} \u00b7 ${flows.length} elements</div>
+<div class="summary">
+  <div class="stat"><b style="color:#16a34a">${c("db")}</b><span>DB primary</span></div>
+  <div class="stat"><b style="color:#d97706">${c("smart")}</b><span>Smart</span></div>
+  <div class="stat"><b style="color:#dc2626">${c("ai")}</b><span>AI healed</span></div>
+  <div class="stat"><b style="color:#64748b">${unresolved}</b><span>Unresolved</span></div>
+</div>
+${cards}
+</body></html>`;
+
+  fs.mkdirSync(outDir, { recursive: true });
+  const out = path.join(outDir, "self-healing-report.html");
+  fs.writeFileSync(out, html, "utf-8");
+  return out;
+}
