@@ -1,0 +1,54 @@
+import fs from "fs";
+import path from "path";
+import { HealFlow, FlowStep } from "./types";
+
+const flows: HealFlow[] = [];
+let current: HealFlow | null = null;
+
+export function beginFlow(
+  elementName: string,
+  testName: string,
+  pageUrl: string
+): void {
+  current = {
+    elementName,
+    testName,
+    pageUrl,
+    startedAt: new Date().toISOString(),
+    steps: [],
+    finalTier: null,
+    finalLocator: null,
+    healed: false,
+    writtenBack: false,
+  };
+}
+
+export function logStep(step: Omit<FlowStep, "order">): void {
+  if (!current) return;
+  current.steps.push({ order: current.steps.length + 1, ...step });
+}
+
+export function endFlow(opts: {
+  finalTier: HealFlow["finalTier"];
+  finalLocator: string | null;
+  healed: boolean;
+  writtenBack: boolean;
+}): void {
+  if (!current) return;
+  Object.assign(current, opts);
+  flows.push(current);
+  current = null;
+}
+
+export function flushFlows(outDir: string): void {
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(outDir, "heal-flows.json"),
+    JSON.stringify(flows, null, 2),
+    "utf-8"
+  );
+}
+
+export function getFlows(): HealFlow[] {
+  return flows;
+}
