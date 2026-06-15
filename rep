@@ -1,420 +1,352 @@
-import { test, expect, Page, Locator } from '@playwright/test';
-import { allure } from 'allure-playwright';
-import { saveElement, getElement } from '../core/db/elementRepo';
-import { findWithFallback, buildLocator, isValidLocator } from '../core/healing/fallBackEngine';
-import {
-  buildSmartLocatorBundle,
-  captureElementScreenshot,
-  captureFullPageScreenshot,
-  getElementOuterHTML,
-  getMinimalFullDOM,
-} from '../utils/selfHealing';
-import { beginFlow, logStep, endFlow } from '../src/reporting/flowTracker';
+import fs from "fs";
+import path from "path";
+import { HealFlow } from "./types";
 
-/* ------------------------------------------------------------------ *
- *  Pacing
- * ------------------------------------------------------------------ */
-const PACE = { micro: 500, short: 1000, medium: 1500 };
+/**
+ * Self-Healing Flow Dashboard
+ * ---------------------------
+ * Drop-in replacement for the previous renderHtml(flows, outDir).
+ * Every figure on the page is derived from the live `flows[]` array that
+ * flowTracker collects during the run. Nothing is hardcoded — if a tier has
+ * zero entries the bar/segment simply renders at zero width.
+ */
 
-async function settle(page: Page, ms = PACE.short) {
-  await page.waitForTimeout(ms);
+const esc = (s?: string | number | null) =>
+  String(s ?? "—")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+const TIER_META = {
+  db: { label: "DB Primary", color: "#2DD4A7" },
+  smart: { label: "Smart Locator", color: "#F4B740" },
+  ai: { label: "AI Healed", color: "#FF6B6B" },
+  unresolved: { label: "Unresolved", color: "#6B7A99" },
+} as const;
+
+type TierKey = keyof typeof TIER_META;
+
+function pct(n: number, total: number): number {
+  return total === 0 ? 0 : Math.round((n / total) * 1000) / 10;
 }
 
-/* ------------------------------------------------------------------ *
- *  First-visible candidate resolver (capture phase)
- * ------------------------------------------------------------------ */
-async function firstVisible(page: Page, candidates: Locator[], timeout = 8000): Promise<Locator> {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    for (const c of candidates) {
-      try {
-        if (await c.first().isVisible()) return c.first();
-      } catch { /* keep trying */ }
-    }
-    await page.waitForTimeout(250);
+export function renderHtml(flows: HealFlow[], outDir: string): string {
+  const total = flows.length;
+
+  const count = (t: string) => flows.filter((f) => f.finalTier === t).length;
+  const dbN = count("db");
+  const smartN = count("smart");
+  const aiN = count("ai");
+  const unresolvedN = flows.filter((f) => !f.finalTier).length;
+
+  const healedN = flows.filter((f) => f.healed).length;
+  const writtenN = flows.filter((f) => f.writtenBack).length;
+  const resolvedN = total - unresolvedN;
+
+  // Resilience score: share of elements resolved at ANY tier without manual help
+  const resilience = pct(resolvedN, total);
+
+  // Avg steps to resolve (depth of fallback chain actually used)
+  const totalSteps = flows.reduce((a, f) => a + (f.steps?.length ?? 0), 0);
+  const avgSteps = total === 0 ? 0 : Math.round((totalSteps / total) * 10) / 10;
+
+  // Total time across all logged steps (ms) where durations exist
+  const totalMs = flows.reduce(
+    (a, f) => a + (f.steps?.reduce((s, st) => s + (st.durationMs ?? 0), 0) ?? 0),
+    0
+  );
+
+  // ---- Tier distribution bar (segments scale to live counts) ----
+  const distOrder: TierKey[] = ["db", "smart", "ai", "unresolved"];
+  const distSegments = distOrder
+    .map((k) => {
+      const n =
+        k === "unresolved"
+          ? unresolvedN
+          : k === "db"
+          ? dbN
+          : k === "smart"
+          ? smartN
+          : aiN;
+      const w = pct(n, total);
+      if (w === 0) return "";
+      return `<div class="seg" style="width:${w}%;background:${TIER_META[k].color}" title="${TIER_META[k].label}: ${n}">${
+        w >= 8 ? `<span>${n}</span>` : ""
+      }</div>`;
+    })
+    .join("");
+
+  const distLegend = distOrder
+    .map((k) => {
+      const n =
+        k === "unresolved"
+          ? unresolvedN
+          : k === "db"
+          ? dbN
+          : k === "smart"
+          ? smartN
+          : aiN;
+      return `<li><span class="dot" style="background:${TIER_META[k].color}"></span>${TIER_META[k].label}<b>${n}</b></li>`;
+    })
+    .join("");
+
+  // ---- Heal timeline: each element as a chip on the resolution path ----
+  const timeline = flows
+    .map((f) => {
+      const tier = (f.finalTier ?? "unresolved") as TierKey;
+      const meta = TIER_META[tier] ?? TIER_META.unresolved;
+      return `<div class="tl-chip" style="--c:${meta.color}">
+        <span class="tl-tier">${meta.label}</span>
+        <span class="tl-name">${esc(f.elementName)}</span>
+        ${f.writtenBack ? `<span class="tl-wb" title="Promoted back to locator store">↩ written back</span>` : ""}
+      </div>`;
+    })
+    .join("");
+
+  // ---- Detail rows ----
+  const rows = flows
+    .map((f, i) => {
+      const tier = (f.finalTier ?? "unresolved") as TierKey;
+      const meta = TIER_META[tier] ?? TIER_META.unresolved;
+      const stepRows = (f.steps ?? [])
+        .map(
+          (s) => `<tr>
+        <td>${s.order}</td>
+        <td><span class="mini ${s.tier}">${esc(s.tier)}</span></td>
+        <td>${esc(s.action)}</td>
+        <td class="st-${s.status}">${esc(s.status)}</td>
+        <td class="loc">${esc(s.locator)}</td>
+        <td>${s.durationMs != null ? s.durationMs + " ms" : "—"}</td>
+      </tr>`
+        )
+        .join("");
+
+      return `<tr class="main" data-row="${i}">
+        <td class="ix">${String(i + 1).padStart(2, "0")}</td>
+        <td class="el">${esc(f.elementName)}</td>
+        <td class="tc">${esc(f.testName)}</td>
+        <td><span class="tier" style="background:${meta.color}1f;color:${meta.color}">${meta.label}</span></td>
+        <td>${f.healed ? `<span class="yes">Healed</span>` : `<span class="no">—</span>`}</td>
+        <td>${f.writtenBack ? `<span class="yes">Yes</span>` : `<span class="no">—</span>`}</td>
+        <td class="loc">${esc(f.finalLocator)}</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="${i}">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody>${stepRows || `<tr><td colspan="6" class="empty">No steps recorded</td></tr>`}</tbody>
+          </table>
+        </td>
+      </tr>`;
+    })
+    .join("");
+
+  const generated = new Date().toLocaleString();
+
+  const html = `<!doctype html><html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Knitwell · Self-Healing Flow Report</title>
+<style>
+  :root{
+    --bg:#0B1220; --panel:#111B2E; --panel-2:#0E1626; --line:#1E2B45;
+    --ink:#E8EEF7; --muted:#8DA0BF; --faint:#5C6E8C;
+    --db:#2DD4A7; --smart:#F4B740; --ai:#FF6B6B; --unres:#6B7A99;
+    --accent:#5B8DEF;
+    --mono:'JetBrains Mono','SF Mono',ui-monospace,Menlo,Consolas,monospace;
+    --sans:'Inter','Segoe UI',system-ui,-apple-system,sans-serif;
   }
-  return candidates[0].first();
-}
+  *{box-sizing:border-box}
+  body{margin:0;background:
+    radial-gradient(1200px 600px at 85% -10%,#16243f 0%,transparent 55%),
+    var(--bg);
+    color:var(--ink);font-family:var(--sans);
+    -webkit-font-smoothing:antialiased;padding:34px 30px 60px;line-height:1.5}
 
-/* ------------------------------------------------------------------ *
- *  Baseline capture — persists primary + smart bundle + context
- * ------------------------------------------------------------------ */
-async function captureElement(
-  page: Page,
-  elementName: string,
-  locator: Locator,
-  primaryLocatorStr: string
-) {
-  try {
-    await locator.waitFor({ state: 'visible', timeout: 8000 });
+  .topbar{display:flex;align-items:flex-end;justify-content:space-between;
+    flex-wrap:wrap;gap:16px;margin-bottom:30px}
+  .brand{display:flex;flex-direction:column;gap:6px}
+  .brand .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.32em;
+    color:var(--db);text-transform:uppercase}
+  .brand h1{margin:0;font-size:30px;font-weight:700;letter-spacing:-.01em}
+  .brand .sub{color:var(--muted);font-size:14px}
+  .gen{font-family:var(--mono);font-size:12px;color:var(--faint);text-align:right}
 
-    const bundle = await buildSmartLocatorBundle(locator, elementName);
+  /* Hero score */
+  .hero{display:grid;grid-template-columns:280px 1fr;gap:22px;margin-bottom:22px}
+  @media(max-width:860px){.hero{grid-template-columns:1fr}}
+  .score{background:linear-gradient(160deg,var(--panel),var(--panel-2));
+    border:1px solid var(--line);border-radius:18px;padding:26px;
+    display:flex;flex-direction:column;justify-content:center;align-items:center;
+    position:relative;overflow:hidden}
+  .ring{position:relative;width:180px;height:180px}
+  .ring svg{transform:rotate(-90deg)}
+  .ring .val{position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center}
+  .ring .num{font-size:46px;font-weight:700;letter-spacing:-.02em}
+  .ring .num small{font-size:20px;color:var(--muted)}
+  .ring .cap{font-family:var(--mono);font-size:11px;letter-spacing:.18em;
+    color:var(--muted);text-transform:uppercase;margin-top:2px}
 
-    const [elementShot, fullPageShot, outerHTML, contextDom] = await Promise.all([
-      captureElementScreenshot(locator).catch(() => null),
-      captureFullPageScreenshot(page).catch(() => null),
-      getElementOuterHTML(locator).catch(() => ''),
-      getMinimalFullDOM(page).catch(() => ''),
-    ]);
+  .dist{background:linear-gradient(160deg,var(--panel),var(--panel-2));
+    border:1px solid var(--line);border-radius:18px;padding:24px 26px;
+    display:flex;flex-direction:column;gap:18px}
+  .dist h3{margin:0;font-size:13px;font-family:var(--mono);letter-spacing:.16em;
+    text-transform:uppercase;color:var(--muted);font-weight:600}
+  .bar{display:flex;height:46px;border-radius:11px;overflow:hidden;
+    background:#0a0f1c;border:1px solid var(--line)}
+  .bar .seg{display:flex;align-items:center;justify-content:center;
+    color:#06121b;font-weight:700;font-size:13px;transition:width .6s ease;min-width:2px}
+  .bar .seg span{padding:0 4px}
+  .legend{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:20px}
+  .legend li{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+  .legend b{color:var(--ink);font-size:15px;margin-left:2px}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
 
-    await saveElement({
-      elementName,
-      pageUrl: page.url(),
-      primaryLocator: primaryLocatorStr,
-      smartLocators: bundle.smartLocators,
-      meta: bundle.meta,
-      outerHTML,
-      context_dom: contextDom,
-      elementScreenshot: elementShot,
-      fullPageScreenshot: fullPageShot,
-    });
+  /* Stat cards */
+  .stats{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:26px}
+  @media(max-width:1100px){.stats{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:18px 18px 16px}
+  .stat .v{font-size:30px;font-weight:700;letter-spacing:-.02em;line-height:1}
+  .stat .l{color:var(--muted);font-size:12.5px;margin-top:8px}
+  .stat.accent .v{color:var(--db)}
 
-    allure.attachment('Smart Locators', JSON.stringify(bundle.smartLocators, null, 2), 'application/json');
-    allure.attachment('Element Metadata', JSON.stringify(bundle.meta, null, 2), 'application/json');
-    allure.attachment('Outer HTML', outerHTML, 'text/html');
-    if (elementShot) allure.attachment('Element Screenshot', Buffer.from(elementShot, 'base64'), 'image/jpeg');
-    if (fullPageShot) allure.attachment('Full Page Screenshot', Buffer.from(fullPageShot, 'base64'), 'image/jpeg');
+  /* Timeline */
+  .section-h{font-family:var(--mono);font-size:12px;letter-spacing:.2em;
+    text-transform:uppercase;color:var(--muted);margin:30px 0 14px}
+  .timeline{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:8px}
+  .tl-chip{display:flex;align-items:center;gap:9px;background:var(--panel);
+    border:1px solid var(--line);border-left:3px solid var(--c);
+    border-radius:9px;padding:9px 13px;font-size:13px}
+  .tl-tier{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;
+    color:var(--c);text-transform:uppercase;font-weight:600}
+  .tl-name{color:var(--ink);font-weight:500}
+  .tl-wb{font-size:11px;color:var(--db);font-family:var(--mono)}
 
-    console.log(`captured: ${elementName}`);
-  } catch {
-    console.log(`capture failed: ${elementName}`);
-  }
-}
+  /* Table */
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;
+    overflow:hidden}
+  table.main-t{width:100%;border-collapse:collapse}
+  table.main-t thead th{background:#0c1424;color:var(--muted);text-align:left;
+    padding:14px 16px;font-size:11.5px;font-family:var(--mono);letter-spacing:.1em;
+    text-transform:uppercase;font-weight:600;border-bottom:1px solid var(--line)}
+  table.main-t td{padding:13px 16px;border-bottom:1px solid var(--line);font-size:13.5px;
+    vertical-align:middle}
+  tr.main{cursor:pointer;transition:background .15s}
+  tr.main:hover{background:#0f1a2e}
+  td.ix{font-family:var(--mono);color:var(--faint);font-size:12px}
+  td.el{font-weight:600}
+  td.tc{color:var(--muted);font-size:12.5px}
+  td.loc{font-family:var(--mono);font-size:11.5px;color:var(--muted);
+    max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  td.exp{color:var(--faint);text-align:center;width:30px;transition:transform .2s}
+  tr.main.open td.exp{transform:rotate(180deg);color:var(--accent)}
+  .tier{padding:5px 11px;border-radius:20px;font-size:11.5px;font-weight:700;
+    font-family:var(--mono);letter-spacing:.04em;white-space:nowrap}
+  .yes{color:var(--db);font-weight:600;font-size:12.5px}
+  .no{color:var(--faint)}
 
-/* ------------------------------------------------------------------ *
- *  DB / Smart-locator resolution
- * ------------------------------------------------------------------ */
-async function resolveFromDB(page: Page, elementName: string) {
-  const row = await getElement(elementName);
-  if (!row) return null;
+  tr.detail{display:none}
+  tr.detail.show{display:table-row}
+  tr.detail td{background:var(--panel-2);padding:0 16px 14px}
+  table.steps{width:100%;border-collapse:collapse;margin:6px 0 4px}
+  table.steps th{background:transparent;color:var(--faint);text-align:left;
+    padding:9px 12px;font-size:10.5px;font-family:var(--mono);letter-spacing:.08em;
+    text-transform:uppercase;border-bottom:1px solid var(--line)}
+  table.steps td{padding:9px 12px;font-size:12px;border-bottom:1px solid #16223a}
+  .mini{font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:5px;
+    text-transform:uppercase;letter-spacing:.05em;font-weight:700}
+  .mini.db{background:#2DD4A722;color:var(--db)}
+  .mini.smart{background:#F4B74022;color:var(--smart)}
+  .mini.ai{background:#FF6B6B22;color:var(--ai)}
+  .st-success{color:var(--db)} .st-failed{color:var(--ai)} .st-skipped{color:var(--faint)}
+  .empty{color:var(--faint);text-align:center;padding:14px}
 
-  if (row.primary_locator) {
-    const primary = buildLocator(page, row.primary_locator);
-    if (primary && (await isValidLocator(primary))) {
-      return { locator: primary, strategy: 'db-primary' };
-    }
-  }
+  .foot{margin-top:26px;color:var(--faint);font-size:12px;font-family:var(--mono);
+    text-align:center;letter-spacing:.04em}
+</style></head><body>
 
-  const smart =
-    typeof row.smart_locators === 'string' ? JSON.parse(row.smart_locators) : row.smart_locators;
+  <div class="topbar">
+    <div class="brand">
+      <span class="kicker">Knitwell · Self-Healing</span>
+      <h1>Flow Resolution Dashboard</h1>
+      <span class="sub">Live results from the three-tier fallback chain — DB primary → smart locators → AI healing</span>
+    </div>
+    <div class="gen">Generated<br>${esc(generated)}</div>
+  </div>
 
-  const priority = ['role', 'testId', 'label', 'placeholder', 'text', 'alt', 'title', 'css', 'xpath'];
+  <div class="hero">
+    <div class="score">
+      <div class="ring">
+        <svg width="180" height="180" viewBox="0 0 180 180">
+          <circle cx="90" cy="90" r="78" fill="none" stroke="#1a2740" stroke-width="14"/>
+          <circle cx="90" cy="90" r="78" fill="none" stroke="url(#g)" stroke-width="14"
+            stroke-linecap="round" stroke-dasharray="${(490 * resilience) / 100} 490"/>
+          <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#2DD4A7"/><stop offset="1" stop-color="#5B8DEF"/>
+          </linearGradient></defs>
+        </svg>
+        <div class="val">
+          <div class="num">${resilience}<small>%</small></div>
+          <div class="cap">Resilience</div>
+        </div>
+      </div>
+    </div>
 
-  for (const key of priority) {
-    const locStr = smart?.[key];
-    if (!locStr) continue;
+    <div class="dist">
+      <h3>Tier Distribution · ${total} elements</h3>
+      <div class="bar">${distSegments || '<div class="seg" style="width:100%;background:#1a2740"></div>'}</div>
+      <ul class="legend">${distLegend}</ul>
+    </div>
+  </div>
 
-    const built = buildLocator(page, locStr);
-    if (built) {
-      const valid = await isValidLocator(built);
-      if (valid) {
-        console.log(`[Smart Locator Success] ${key}`);
-        return { locator: built, strategy: key };
-      }
-    }
-  }
+  <div class="stats">
+    <div class="stat"><div class="v">${total}</div><div class="l">Total Elements</div></div>
+    <div class="stat accent"><div class="v">${dbN}</div><div class="l">DB Resolved</div></div>
+    <div class="stat"><div class="v">${smartN}</div><div class="l">Smart Healed</div></div>
+    <div class="stat"><div class="v">${aiN}</div><div class="l">AI Healed</div></div>
+    <div class="stat"><div class="v">${writtenN}</div><div class="l">Written Back</div></div>
+    <div class="stat"><div class="v">${avgSteps}</div><div class="l">Avg Steps / Element</div></div>
+  </div>
 
-  return null;
-}
+  <div class="section-h">Resolution Timeline</div>
+  <div class="timeline">${timeline || '<span class="no">No flows recorded</span>'}</div>
 
-/* ------------------------------------------------------------------ *
- *  step() — capture → DB/smart → AI heal, with flow tracking
- * ------------------------------------------------------------------ */
-async function step(
-  page: Page,
-  elementName: string,
-  captureCandidates: Locator[],
-  primaryLocator: string,
-  action: (loc: Locator) => Promise<void>,
-  label: string
-) {
-  beginFlow(elementName, test.info().title, page.url());
+  <div class="section-h">Element Detail · click a row to expand its tier trace</div>
+  <div class="panel">
+    <table class="main-t">
+      <thead><tr>
+        <th>#</th><th>Element</th><th>Test Case</th><th>Final Tier</th>
+        <th>Healed</th><th>Write-Back</th><th>Final Locator</th><th></th>
+      </tr></thead>
+      <tbody>${rows || '<tr><td colspan="8" class="empty">No elements captured in this run.</td></tr>'}</tbody>
+    </table>
+  </div>
 
-  await test.step(label, async () => {
-    const existing = await getElement(elementName);
+  <div class="foot">
+    ${resolvedN}/${total} resolved · ${healedN} healed · ${writtenN} promoted to store · ${totalMs} ms total tier time
+  </div>
 
-    // ---- NEW ELEMENT: baseline capture ----
-    if (!existing) {
-      await test.step('Baseline Capture', async () => {
-        const el = await firstVisible(page, captureCandidates);
-        await captureElement(page, elementName, el, primaryLocator);
-        await action(el);
-
-        logStep({ tier: 'db', action: 'Primary Locator', locator: primaryLocator, status: 'success' });
-        endFlow({ finalTier: 'db', finalLocator: primaryLocator, healed: false, writtenBack: false });
-      });
-      return;
-    }
-
-    // ---- DB / SMART RESOLUTION ----
-    await test.step('Locator Resolution', async () => {
-      const resolved = await resolveFromDB(page, elementName);
-
-      if (resolved) {
-        const tier = resolved.strategy === 'db-primary' ? 'db' : 'smart';
-        logStep({ tier, action: resolved.strategy, locator: resolved.locator.toString(), status: 'success' });
-
-        await resolved.locator.scrollIntoViewIfNeeded();
-        await action(resolved.locator);
-
-        endFlow({ finalTier: tier, finalLocator: resolved.locator.toString(), healed: false, writtenBack: false });
-        throw { success: true };
-      }
-
-      throw new Error('Locator resolution failed');
-    });
-  }).catch(async (e) => {
-    if (e?.success) return;
-
-    logStep({ tier: 'db', action: 'Locator Resolution', status: 'failed' });
-
-    // ---- AI HEALING ----
-    await test.step(`${elementName} - AI Healing`, async () => {
-      let healed: any;
-
-      await test.step('Generate AI Locator', async () => {
-        healed = await findWithFallback(page, elementName, page.locator('body'), 'ann-taylor page');
-        allure.attachment(
-          'Healing Result',
-          JSON.stringify({ element: elementName, strategy: healed.strategy ?? 'AI' }, null, 2),
-          'application/json'
-        );
-      });
-
-      await test.step('Validate AI Locator', async () => {
-        if (!(await isValidLocator(healed.locator))) {
-          throw new Error(`Could not heal ${elementName}`);
-        }
-      });
-
-      await test.step('Execute Healed Action', async () => {
-        await healed.locator.scrollIntoViewIfNeeded();
-        await action(healed.locator);
-
-        logStep({ tier: 'ai', action: 'AI Healing', locator: healed.locator.toString(), status: 'success' });
-        endFlow({ finalTier: 'ai', finalLocator: healed.locator.toString(), healed: true, writtenBack: true });
-      });
-    });
-  });
-}
-
-/* ================================================================== *
- *  SPEC — Ann Taylor full funnel: homepage → PLP → PDP → cart
- * ================================================================== */
-test.describe('Ann Taylor — Self-Healing Funnel', () => {
-  test('homepage to bag interactions', async ({ page }) => {
-    test.setTimeout(180_000);
-
-    await page.goto('https://sfqa.anntaylor.com/', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(5000);
-
-    // 1 — Dismiss cookie / continue
-    await step(
-      page, 'continue_shopping',
-      [
-        page.locator('#continueButton'),
-        page.locator('.cookie-content #continueButton'),
-        page.getByRole('button', { name: /continue shopping/i }),
-      ],
-      '#continueButton',
-      async (loc) => { await loc.click(); await page.waitForTimeout(2500); },
-      'Continue Shopping'
-    );
-
-    // 2 — Open search
-    await step(
-      page, 'search_toggle',
-      [
-        page.locator('[data-testid="search-icon"]'),
-        page.getByRole('button', { name: /search/i }),
-        page.locator('button[aria-label*="search" i]'),
-      ],
-      '[data-testid="search-icon"]',
-      async (loc) => { await loc.click(); await page.waitForTimeout(1200); },
-      'Open Search'
-    );
-
-    // 3 — Type a search query
-    await step(
-      page, 'search_input',
-      [
-        page.getByRole('searchbox'),
-        page.getByPlaceholder(/search/i),
-        page.locator('input[type="search"]'),
-      ],
-      'input[type="search"]',
-      async (loc) => { await loc.fill('dress'); await loc.press('Enter'); await page.waitForLoadState('domcontentloaded'); await page.waitForTimeout(2500); },
-      'Search Dresses'
-    );
-
-    await page.mouse.wheel(0, 600);
-    await settle(page);
-
-    // 4 — Newsletter / email capture (often a healing candidate)
-    await step(
-      page, 'newsletter_signup',
-      [
-        page.getByPlaceholder(/email address/i),
-        page.locator('#emailSignup'),
-        page.locator('input[name*="email" i]'),
-      ],
-      '#emailSignup',
-      async (loc) => { await loc.scrollIntoViewIfNeeded(); await page.waitForTimeout(800); },
-      'Locate Newsletter Field'
-    );
-
-    // 5 — Open a seasonal promo link
-    await step(
-      page, 'shades_of_the_season',
-      [
-        page.getByRole('link', { name: /shades of the season/i }),
-        page.getByText(/shades of the season/i),
-        page.locator('a[href*="season" i]'),
-      ],
-      'shades of the season',
-      async (loc) => { await loc.click(); await page.waitForLoadState('domcontentloaded'); await page.waitForTimeout(3000); },
-      'Open Shades Of The Season'
-    );
-
-    await page.mouse.wheel(0, 1200);
-    await settle(page, PACE.medium);
-
-    // 6 — Filter toggle on PLP
-    await step(
-      page, 'plp_filter_toggle',
-      [
-        page.getByRole('button', { name: /filter/i }),
-        page.locator('[data-testid="filter-toggle"]'),
-        page.getByText(/^filter$/i),
-      ],
-      '[data-testid="filter-toggle"]',
-      async (loc) => { await loc.click().catch(() => {}); await page.waitForTimeout(1200); },
-      'Open Filters'
-    );
-
-    // 7 — Sort dropdown
-    await step(
-      page, 'plp_sort',
-      [
-        page.getByRole('combobox', { name: /sort/i }),
-        page.locator('select[name*="sort" i]'),
-        page.getByText(/sort by/i),
-      ],
-      'select[name*="sort" i]',
-      async (loc) => { await loc.scrollIntoViewIfNeeded(); await page.waitForTimeout(800); },
-      'Locate Sort Control'
-    );
-
-    // 8 — First product tile
-    await step(
-      page, 'dress_product',
-      [
-        page.locator('[data-testid*="product"]').first(),
-        page.locator('.product-tile a').first(),
-        page.locator('a[href*="/p/"]').first(),
-      ],
-      '[data-testid*="product"]',
-      async (loc) => { await loc.click(); await page.waitForLoadState('domcontentloaded'); await page.waitForTimeout(3000); },
-      'Open Dress Product'
-    );
-
-    await page.mouse.wheel(0, 500);
-    await settle(page);
-
-    // 9 — Color swatch (frequent heal candidate)
-    await step(
-      page, 'color_swatch',
-      [
-        page.getByLabel(/color/i).first(),
-        page.locator('[data-testid*="swatch"]').first(),
-        page.locator('.color-swatch, .swatch').first(),
-      ],
-      '.swatch',
-      async (loc) => { await loc.click().catch(() => {}); await page.waitForTimeout(1200); },
-      'Select Color Swatch'
-    );
-
-    // 10 — Size selection
-    await step(
-      page, 'dress_size',
-      [
-        page.getByRole('button', { name: /^XS\/S$/i, disabled: false }),
-        page.getByRole('button', { name: /^M$/i, disabled: false }),
-        page.getByRole('button', { name: /^L$/i, disabled: false }),
-      ],
-      'button.size-option',
-      async (loc) => { await loc.click(); await page.waitForTimeout(1500); },
-      'Select Dress Size'
-    );
-
-    // 11 — Quantity stepper
-    await step(
-      page, 'qty_increase',
-      [
-        page.getByRole('button', { name: /increase|plus|\+/i }),
-        page.locator('[data-testid="qty-plus"]'),
-        page.locator('button[aria-label*="increase" i]'),
-      ],
-      '[data-testid="qty-plus"]',
-      async (loc) => { await loc.click().catch(() => {}); await page.waitForTimeout(800); },
-      'Increase Quantity'
-    );
-
-    // 12 — Add to bag
-    await step(
-      page, 'add_to_bag',
-      [
-        page.locator('#addToCart'),
-        page.getByRole('button', { name: /add to bag/i }),
-        page.getByText(/add to bag/i),
-      ],
-      '#addToCart',
-      async (loc) => { await loc.click(); await page.waitForTimeout(3000); },
-      'Add To Bag'
-    );
-
-    // 13 — Open mini-cart
-    await step(
-      page, 'mini_cart_open',
-      [
-        page.locator('#miniCart'),
-        page.getByRole('button', { name: /view bag|cart/i }),
-        page.locator('[data-testid="cart-link"]'),
-      ],
-      '#miniCart',
-      async (loc) => { await loc.click().catch(() => {}); await page.waitForTimeout(2000); },
-      'Open Mini Cart'
-    );
-
-    // 14 — Promo code field (deep heal candidate)
-    await step(
-      page, 'promo_code_field',
-      [
-        page.getByPlaceholder(/promo|gift card/i),
-        page.locator('#promoCode'),
-        page.locator('input[name*="promo" i]'),
-      ],
-      '#promoCode',
-      async (loc) => { await loc.scrollIntoViewIfNeeded().catch(() => {}); await page.waitForTimeout(800); },
-      'Locate Promo Field'
-    );
-
-    // 15 — Proceed to checkout
-    await step(
-      page, 'checkout_button',
-      [
-        page.locator('[data-testid="checkout-cta"]'),
-        page.getByRole('button', { name: /checkout|proceed/i }),
-        page.getByText(/checkout/i),
-      ],
-      '[data-testid="checkout-cta"]',
-      async (loc) => { await loc.click().catch(() => {}); await page.waitForTimeout(2500); },
-      'Proceed To Checkout'
-    );
-
-    // 16 — Verify bag state
-    await test.step('Verify Item Added To Bag', async () => {
-      await expect(page.locator('body')).toContainText(/bag|cart|added|checkout/i);
+<script>
+  document.querySelectorAll('tr.main').forEach(function(r){
+    r.addEventListener('click',function(){
+      var i=r.getAttribute('data-row');
+      var d=document.querySelector('tr.detail[data-detail="'+i+'"]');
+      if(!d)return;
+      r.classList.toggle('open');
+      d.classList.toggle('show');
     });
   });
-});
+</script>
+</body></html>`;
+
+  fs.writeFileSync(path.join(outDir, "report-data.json"), JSON.stringify(flows, null, 2));
+  const out = path.join(outDir, "index.html");
+  fs.writeFileSync(out, html);
+  console.log("Dashboard created:", out);
+  return out;
+}
