@@ -1,0 +1,66 @@
+import type { Reporter, FullConfig } from "@playwright/test/reporter";
+import fs from "fs";
+import path from "path";
+import { HealFlow } from "./types";
+import { renderHtml } from "./renderHtml";
+
+const OUT = process.env.SELF_HEALING_OUT || "self-healing-output";
+const SHARD_DIR = path.join(OUT, "shards");
+
+export default class SelfHealingReporter implements Reporter {
+  onBegin(_config: FullConfig) {
+    // Clear stale shards from a previous run so the report is fresh.
+    try {
+      if (fs.existsSync(SHARD_DIR)) {
+        for (const f of fs.readdirSync(SHARD_DIR)) {
+          fs.unlinkSync(path.join(SHARD_DIR, f));
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  onEnd() {
+    const flows = this.collectShards();
+
+    // Stable order: unresolved first, then AI, smart, db; alpha within tier.
+    const rank: Record<string, number> = { "": 0, ai: 1, smart: 2, db: 3 };
+    flows.sort((a, b) => {
+      const ra = rank[a.finalTier ?? ""] ?? 9;
+      const rb = rank[b.finalTier ?? ""] ?? 9;
+      if (ra !== rb) return ra - rb;
+      return a.elementName.localeCompare(b.elementName);
+    });
+
+    // Always write the merged JSON, even if empty, for debugging.
+    fs.mkdirSync(OUT, { recursive: true });
+    fs.writeFileSync(
+      path.join(OUT, "heal-flows.json"),
+      JSON.stringify(flows, null, 2),
+      "utf-8"
+    );
+
+    const out = renderHtml(flows, OUT);
+    console.log(
+      `\n[self-healing] ${flows.length} flow(s) recorded -> ${out}\n`
+    );
+  }
+
+  private collectShards(): HealFlow[] {
+    const all: HealFlow[] = [];
+    if (!fs.existsSync(SHARD_DIR)) return all;
+
+    for (const file of fs.readdirSync(SHARD_DIR)) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const raw = fs.readFileSync(path.join(SHARD_DIR, file), "utf-8");
+        const parsed = JSON.parse(raw) as HealFlow[];
+        if (Array.isArray(parsed)) all.push(...parsed);
+      } catch {
+        // skip a corrupt shard rather than failing the whole report
+      }
+    }
+    return all;
+  }
+}
