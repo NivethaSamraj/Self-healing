@@ -1,0 +1,25 @@
+export type Tier = "db" | "smart" | "ai";
+export type StepStatus = "success" | "failed" | "skipped";
+
+export interface FlowStep {
+  order: number;
+  tier: Tier;
+  action: string;
+  locator?: string;
+  status: StepStatus;
+  reason?: string;
+  durationMs?: number;
+  confidence?: number;
+}
+
+export interface HealFlow {
+  elementName: string;
+  testName: string;
+  pageUrl: string;
+  startedAt: string;
+  steps: FlowStep[];
+  finalTier: Tier | null;
+  finalLocator: string | null;
+  healed: boolean;
+  writtenBack: boolean;
+}
