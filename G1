@@ -1,39 +1,78 @@
-import { Page, Locator } from '@playwright/test';
-import { getElement } from '../db/elementRepo';
-import { getAILocator } from '../ai/aiHealing';
-import { saveHealingLog } from '../db/healingRepo';
-import { getMinimalFullDOM } from '../../utils/selfHealing';
-import { HealingLogger } from '../../utils/healingLogger';
-import { containsDynamicId } from '../../utils/selfHealing';
-import { beginFlow, logStep, endFlow } from '../../reporting/sink';
+import fs from "fs";
+import path from "path";
+import { HealFlow, FlowStep } from "./types";
 
-//  TYPE FIRST
-type FallbackResult = {
-  locator: Locator;
-  usedStrategy: string;
-};
+// Output dir shared with the reporter. Keep in sync with SelfHealingReporter.OUT.
+const OUT = process.env.SELF_HEALING_OUT || "self-healing-output";
+const SHARD_DIR = path.join(OUT, "shards");
 
-export async function findWithFallback(
-  page: Page,
+const flows: HealFlow[] = [];
+let current: HealFlow | null = null;
+let exitHookRegistered = false;
+
+export function beginFlow(
   elementName: string,
-  primaryLocator: Locator,
-  testName: string = 'default-test'
-): Promise<FallbackResult> {
+  testName: string,
+  pageUrl: string
+): void {
+  current = {
+    elementName,
+    testName,
+    pageUrl,
+    startedAt: new Date().toISOString(),
+    steps: [],
+    finalTier: null,
+    finalLocator: null,
+    healed: false,
+    writtenBack: false,
+  };
+  registerExitHook();
+}
 
-  const attempted: string[] = [];
+export function logStep(step: Omit<FlowStep, "order">): void {
+  if (!current) return;
+  current.steps.push({ order: current.steps.length + 1, ...step });
+}
 
-  // =========================================================
-  // START FLOW RECORDING (HTML report)
-  // =========================================================
-  beginFlow(elementName, testName, page.url());
+export function endFlow(opts: {
+  finalTier: HealFlow["finalTier"];
+  finalLocator: string | null;
+  healed: boolean;
+  writtenBack: boolean;
+}): void {
+  if (!current) return;
+  Object.assign(current, opts);
+  flows.push(current);
+  current = null;
+}
 
-  // =========================================================
-  // START LOGGING
-  // =========================================================
+export function getFlows(): HealFlow[] {
+  return flows;
+}
 
-  HealingLogger.info('Test', testName);
-  HealingLogger.info('Element', elementName);
-  HealingLogger.info('Page', page.url());
+// Each Playwright worker is a separate process with its own `flows` array.
+// On worker exit, write a uniquely-named shard. The reporter merges them.
+function writeShard(): void {
+  if (flows.length === 0) return;
+  try {
+    fs.mkdirSync(SHARD_DIR, { recursive: true });
+    const name = `flows-${process.pid}-${Date.now()}.json`;
+    fs.writeFileSync(
+      path.join(SHARD_DIR, name),
+      JSON.stringify(flows, null, 2),
+      "utf-8"
+    );
+  } catch {
+    // best-effort; never break the test run because of reporting
+  }
+}
+
+function registerExitHook(): void {
+  if (exitHookRegistered) return;
+  exitHookRegistered = true;
+  // 'exit' must be synchronous — writeShard uses sync fs calls, which is fine.
+  process.on("exit", writeShard);
+}
 
   HealingLogger.info('AI SELF-HEALING STARTED', 'Azure_OpenAI');
 
