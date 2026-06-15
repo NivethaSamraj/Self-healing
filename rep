@@ -1,0 +1,944 @@
+import { test, expect, Page, Locator } from '@playwright/test';
+import { allure } from 'allure-playwright';
+import { saveElement, getElement } from '../core/db/elementRepo';
+import { findWithFallback, buildLocator, isValidLocator } from '../core/healing/fallBackEngine';
+import {
+    buildSmartLocatorBundle,
+    captureElementScreenshot,
+    captureFullPageScreenshot,
+    getElementOuterHTML,
+    getMinimalFullDOM,
+} from '../utils/selfHealing';
+
+
+const PACE = {
+    micro: 500,
+    short: 1000,
+    medium: 1500
+};
+
+async function settle(page: Page, ms = PACE.short) {
+    await page.waitForTimeout(ms);
+}
+
+async function firstVisible(
+    page: Page,
+    candidates: Locator[],
+    timeout = 8000
+): Promise<Locator> {
+
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+
+        for (const c of candidates) {
+            try {
+
+                if (await c.first().isVisible()) {
+                    return c.first();
+                }
+
+            } catch { }
+        }
+
+        await page.waitForTimeout(250);
+    }
+
+    return candidates[0].first();
+}
+
+async function captureElement(
+    page: Page,
+    elementName: string,
+    locator: Locator,
+    primaryLocatorStr: string
+) {
+
+    try {
+
+        await locator.waitFor({
+            state: 'visible',
+            timeout: 8000
+        });
+
+        const bundle =
+            await buildSmartLocatorBundle(
+                locator,
+                elementName
+            );
+
+        const [
+            elementShot,
+            fullPageShot,
+            outerHTML,
+            contextDom
+        ] = await Promise.all([
+            captureElementScreenshot(locator).catch(() => null),
+            captureFullPageScreenshot(page).catch(() => null),
+            getElementOuterHTML(locator).catch(() => ''),
+            getMinimalFullDOM(page).catch(() => '')
+        ]);
+
+        await saveElement({
+            elementName,
+            pageUrl: page.url(),
+            primaryLocator: primaryLocatorStr,
+            smartLocators: bundle.smartLocators,
+            meta: bundle.meta,
+            outerHTML,
+            context_dom: contextDom,
+            elementScreenshot: elementShot,
+            fullPageScreenshot: fullPageShot
+        });
+
+
+        allure.attachment(
+            'Smart Locators',
+            JSON.stringify(
+                bundle.smartLocators,
+                null,
+                2
+            ),
+            'application/json'
+        );
+
+        allure.attachment(
+            'Element Metadata',
+            JSON.stringify(
+                bundle.meta,
+                null,
+                2
+            ),
+            'application/json'
+        );
+
+        allure.attachment(
+            'Outer HTML',
+            outerHTML,
+            'text/html'
+        );
+        if (elementShot) {
+            allure.attachment(
+                'Element Screenshot',
+                Buffer.from(
+                    elementShot,
+                    'base64'
+                ),
+                'image/jpeg'
+            );
+        }
+
+        if (fullPageShot) {
+            allure.attachment(
+                'Full Page Screenshot',
+                Buffer.from(
+                    fullPageShot,
+                    'base64'
+                ),
+                'image/jpeg'
+            );
+        }
+        console.log(`captured: ${elementName}`);
+
+    } catch (err: any) {
+
+        console.log(
+            `capture failed: ${elementName}`
+        );
+    }
+}
+
+async function resolveFromDB(
+    page: Page,
+    elementName: string
+) {
+
+    const row =
+        await getElement(elementName);
+
+    if (!row) return null;
+
+    if (row.primary_locator) {
+
+        const primary =
+            buildLocator(
+                page,
+                row.primary_locator
+            );
+
+        if (
+            primary &&
+            await isValidLocator(primary)
+        ) {
+            return {
+                locator: primary,
+                strategy: 'db-primary'
+            };
+        }
+    }
+
+
+    const smart =
+        typeof row.smart_locators === 'string'
+            ? JSON.parse(row.smart_locators)
+            : row.smart_locators;
+
+    console.log(
+        'SMART LOCATORS:',
+        JSON.stringify(smart, null, 2)
+    );
+
+    const priority = [
+        'role',
+        'testId',
+        'label',
+        'placeholder',
+        'text',
+        'alt',
+        'title',
+        'css',
+        'xpath'
+    ];
+
+    for (const key of priority) {
+
+        const locStr = smart?.[key];
+
+        if (!locStr) continue;
+
+        const built =
+            buildLocator(page, locStr);
+
+        if (built) {
+
+            const valid =
+                await isValidLocator(built);
+
+            console.log(
+                `[Smart Locator] ${key} = ${locStr}`
+            );
+
+            console.log(
+                `[Valid] ${valid}`
+            );
+
+            if (valid) {
+
+                console.log(
+                    `[Smart Locator Success] ${key}`
+                );
+
+                return {
+                    locator: built,
+                    strategy: key
+                };
+            }
+        }
+    }
+
+    return null;
+
+}
+import {
+  beginFlow,
+  logStep,
+  endFlow
+} from "../src/reporting/flowTracker";
+
+
+
+async function step(
+    page: Page,
+    elementName: string,
+    captureCandidates: Locator[],
+    primaryLocator: string,
+    action: (loc: Locator) => Promise<void>,
+    label: string
+) {
+
+    beginFlow(
+   elementName,
+   test.info().title,
+   page.url()
+);
+    await test.step(label, async () => {
+
+        const existing = await getElement(elementName);
+
+        //
+        // NEW ELEMENT
+        //
+        if (!existing) {
+
+            await test.step(
+                'Baseline Capture',
+                async () => {
+
+                    const el =
+                        await firstVisible(
+                            page,
+                            captureCandidates
+                        );
+
+                    await captureElement(
+                        page,
+                        elementName,
+                        el,
+                        primaryLocator
+                    );
+
+                    await action(el);
+                    logStep({
+    tier: "db",
+    action: "Primary Locator",
+    locator: primaryLocator,
+    status: "success"
+});
+
+endFlow({
+    finalTier: "db",
+    finalLocator: primaryLocator,
+    healed: false,
+    writtenBack: false
+});
+
+                }
+            );
+
+            return;
+        }
+
+        //
+        // DB / SMART LOCATOR
+        //
+        await test.step(
+            'Locator Resolution',
+            async () => {
+
+                const resolved =
+                    await resolveFromDB(
+                        page,
+                        elementName
+                    );
+if (resolved) {
+
+   const tier =
+      resolved.strategy === 'db-primary'
+         ? 'db'
+         : 'smart';
+
+   logStep({
+      tier,
+      action: resolved.strategy,
+      locator: resolved.locator.toString(),
+      status: 'success'
+   });
+
+   await resolved.locator.scrollIntoViewIfNeeded();
+
+   await action(resolved.locator);
+
+   endFlow({
+      finalTier: tier,
+      finalLocator: resolved.locator.toString(),
+      healed: false,
+      writtenBack: false
+   });
+
+   throw { success: true };
+}
+
+throw new Error('Locator resolution failed');
+        });
+
+    }).catch(async (e) => {
+
+    logStep({
+       tier: 'db',
+       action: 'Locator Resolution',
+       status: 'failed'
+    });
+
+    if (e?.success) {
+        return;
+    }
+
+        //
+        // AI HEALING
+        //
+        await test.step(
+            `${elementName} - AI Healing`,
+            async () => {
+
+                let healed: any;
+
+                await test.step(
+                    'Generate AI Locator',
+                    async () => {
+
+                        healed =
+                            await findWithFallback(
+                                page,
+                                elementName,
+                                page.locator('body'),
+                                'ann-taylor page'
+                            );
+
+                        allure.attachment(
+                            'Healing Result',
+                            JSON.stringify(
+                                {
+                                    element: elementName,
+                                    strategy:
+                                        healed.strategy ?? 'AI'
+                                },
+                                null,
+                                2
+                            ),
+                            'application/json'
+                        );
+                    }
+                );
+
+                await test.step(
+                    'Validate AI Locator',
+                    async () => {
+
+                        if (
+                            !(await isValidLocator(
+                                healed.locator
+                            ))
+                        ) {
+                            throw new Error(
+                                `Could not heal ${elementName}`
+                            );
+                        }
+
+                    }
+                );
+
+                await test.step(
+                    'Execute Healed Action',
+                    async () => {
+
+                        await healed.locator.scrollIntoViewIfNeeded();
+
+                        await action(
+                            healed.locator
+                        );
+                        logStep({
+   tier: 'ai',
+   action: 'AI Healing',
+   locator: healed.locator.toString(),
+   status: 'success'
+});
+
+endFlow({
+   finalTier: 'ai',
+   finalLocator: healed.locator.toString(),
+   healed: true,
+   writtenBack: true
+});
+
+                    }
+                );
+            }
+        );
+    });
+}
+test.describe(
+    'Ann taylor Homepage',
+    () => {
+
+        test(
+            'homepage interactions',
+            async ({ page }) => {
+
+                await page.goto(
+                    'https://sfqa.anntaylor.com/',
+                    {
+                        waitUntil: 'domcontentloaded'
+                    }
+                
+                );
+                await page.waitForTimeout(5000);
+
+                await step(
+                    page,
+                    'continue_shopping',
+                    [
+                        page.locator('#continueButton'),
+                        page.locator('.cookie-content #continueButton'),
+                        page.getByRole('button', {
+                            name: /continue shopping/i
+                        })
+                    ],
+                    '#continueButton',
+                    async loc => {
+
+                        await loc.click();
+
+                        await page.waitForTimeout(3000);
+
+                    },
+                    'Continue Shopping'
+                );
+
+                //
+                // Scroll homepage
+                //
+                await page.mouse.wheel(0, 800);
+
+                await page.waitForTimeout(2000);
+
+                //
+                // Shades Of The Season
+                //
+                await step(
+                    page,
+                    'shades_of_the_season',
+                    [
+                        page.getByRole('link', {
+                            name: /shades of the season/i
+                        }),
+                        page.getByText(/shades of the season/i)
+                    ],
+                    'shades of the season',
+                    async loc => {
+
+                        await loc.click();
+
+                        await page.waitForLoadState('domcontentloaded');
+
+                        await page.waitForTimeout(3000);
+
+                    },
+                    'Open Shades Of The Season'
+                );
+
+                //
+                // Scroll PLP
+                //
+                await page.mouse.wheel(0, 1200);
+
+                await page.waitForTimeout(2000);
+
+                //
+                // First Dress
+                //
+                await step(
+                    page,
+                    'dress_product',
+                    [
+                        page.locator('[data-testid*="product"]').first(),
+                        page.locator('.product-tile a').first(),
+                        page.locator('a[href*="/p/"]').first()
+                    ],
+                    'first dress',
+                    async loc => {
+
+                        await loc.click();
+
+                        await page.waitForLoadState('domcontentloaded');
+
+                        await page.waitForTimeout(3000);
+
+                    },
+                    'Open Dress Product'
+                );
+
+                //
+                // Size Selection
+                //
+
+
+                await step(
+                    page,
+                    'dress_size',
+                    [
+                        page.getByRole('button', { name: /^XS\/S$/i, disabled: false }),
+                        page.getByRole('button', { name: /^M$/i, disabled: false }),
+                        page.getByRole('button', { name: /^L$/i, disabled: false })
+                    ],
+                    'dress size',
+                    async loc => {
+
+                        await loc.click();
+
+                        await page.waitForTimeout(1500);
+
+                    },
+                    'Select Dress Size'
+                );
+
+                //
+                // Add To Bag
+                //
+               //
+// Add To Bag
+//
+await step(
+    page,
+    'add_to_bag',
+   [
+    page.locator('#addToCart'),
+    page.getByRole('button', { name: /add to bag/i }),
+    page.getByText(/add to bag/i)
+],
+    'add to bag',
+    async loc => {
+
+        await loc.click();
+
+        await page.waitForTimeout(3000);
+
+    },
+    'Add To Bag'
+);
+
+//
+// Verify Item Added To Bag
+//
+await test.step(
+    'Verify Item Added To Bag',
+    async () => {
+
+        await expect(
+            page.locator('body')
+        ).toContainText(
+            /bag|cart|added/i
+        );
+
+    }
+);
+            }
+        );
+    }
+);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import fs from "fs";
+import path from "path";
+import { HealFlow } from "./types";
+
+const tierColor = { db: "#16a34a", smart: "#d97706", ai: "#dc2626" } as const;
+const statusIcon = { success: "\u2713", failed: "\u2717", skipped: "\u2013" } as const;
+
+const esc = (s?: string | number | null) =>
+  String(s ?? "\u2014")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+export function renderHtml(flows: HealFlow[], outDir: string): string {
+  console.log(
+  "REPORT FLOWS:",
+  JSON.stringify(flows, null, 2)
+);
+
+
+const rows = flows.map(f => `
+<tr>
+  <td>${esc(f.elementName)}</td>
+  <td>${esc(f.testName)}</td>
+
+  <td>
+    <span class="tier ${f.finalTier ?? "unresolved"}">
+      ${f.finalTier?.toUpperCase() ?? "UNRESOLVED"}
+    </span>
+  </td>
+
+  <td>${f.healed ? "Yes" : "No"}</td>
+
+  <td>${f.writtenBack ? "Yes" : "No"}</td>
+
+  <td>${esc(f.finalLocator)}</td>
+</tr>
+
+<tr class="details">
+  <td colspan="6">
+
+    <table class="steps">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Tier</th>
+          <th>Action</th>
+          <th>Status</th>
+          <th>Locator</th>
+          <th>Duration</th>
+        </tr>
+      </thead>
+
+      <tbody>
+
+      ${f.steps.map(s => `
+        <tr>
+          <td>${s.order}</td>
+          <td>${s.tier}</td>
+          <td>${esc(s.action)}</td>
+          <td>${s.status}</td>
+          <td>${esc(s.locator)}</td>
+          <td>${s.durationMs ?? "-"}</td>
+        </tr>
+      `).join("")}
+
+      </tbody>
+
+    </table>
+
+  </td>
+</tr>
+`).join("");
+
+  const c = (t: string) => flows.filter((f) => f.finalTier === t).length;
+  const unresolved = flows.filter((f) => !f.finalTier).length;
+
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Self-Healing Flow Report</title>
+<style>
+ body{
+    margin:0;
+    background:#f4f7fb;
+    font-family:'Segoe UI',sans-serif;
+    color:#1e293b;
+    padding:30px;
+}
+
+.header{
+    margin-bottom:30px;
+}
+
+.header h1{
+    margin:0;
+    font-size:28px;
+    font-weight:700;
+}
+
+.header p{
+    color:#64748b;
+}
+
+.summary{
+    display:grid;
+    grid-template-columns:repeat(5,1fr);
+    gap:20px;
+    margin-bottom:30px;
+}
+
+.card{
+    background:#fff;
+    border-radius:12px;
+    padding:20px;
+    box-shadow:0 2px 12px rgba(0,0,0,.08);
+}
+
+.value{
+    font-size:32px;
+    font-weight:700;
+}
+
+.label{
+    color:#64748b;
+    margin-top:6px;
+}
+
+table{
+    width:100%;
+    border-collapse:collapse;
+    background:#fff;
+    border-radius:12px;
+    overflow:hidden;
+    box-shadow:0 2px 12px rgba(0,0,0,.08);
+}
+
+th{
+    background:#0f172a;
+    color:#fff;
+    text-align:left;
+    padding:14px;
+}
+
+td{
+    padding:14px;
+    border-bottom:1px solid #e2e8f0;
+}
+
+tbody tr:hover{
+    background:#f8fafc;
+}
+
+.tier{
+    padding:6px 12px;
+    border-radius:20px;
+    font-size:12px;
+    font-weight:600;
+}
+
+.tier.db{
+    background:#dcfce7;
+    color:#166534;
+}
+
+.tier.smart{
+    background:#fef3c7;
+    color:#92400e;
+}
+
+.tier.ai{
+    background:#fee2e2;
+    color:#991b1b;
+}
+
+.tier.unresolved{
+    background:#e5e7eb;
+    color:#374151;
+}
+
+.details{
+    background:#fafafa;
+}
+
+.steps{
+    width:100%;
+    margin-top:10px;
+}
+
+.steps th{
+    background:#334155;
+    color:#fff;
+    font-size:12px;
+}
+
+.steps td{
+    font-size:12px;
+}
+</style></head><body>
+<div class="header">
+  <h1>Self-Healing Automation Dashboard</h1>
+  <p>
+    Generated ${new Date().toLocaleString()}
+  </p>
+</div>
+
+<div class="summary">
+
+  <div class="card">
+    <div class="value">${flows.length}</div>
+    <div class="label">Total Elements</div>
+  </div>
+
+  <div class="card">
+    <div class="value">${c("db")}</div>
+    <div class="label">DB Resolved</div>
+  </div>
+
+  <div class="card">
+    <div class="value">${c("smart")}</div>
+    <div class="label">Smart Healed</div>
+  </div>
+
+  <div class="card">
+    <div class="value">${c("ai")}</div>
+    <div class="label">AI Healed</div>
+  </div>
+
+  <div class="card">
+    <div class="value">${unresolved}</div>
+    <div class="label">Unresolved</div>
+  </div>
+
+</div>
+
+<table>
+
+<thead>
+<tr>
+<th>Element</th>
+<th>Test Case</th>
+<th>Final Tier</th>
+<th>Healed</th>
+<th>Write Back</th>
+<th>Final Locator</th>
+</tr>
+</thead>
+
+<tbody>
+${rows}
+</tbody>
+
+</table>
+</body></html>`;
+
+
+fs.writeFileSync(
+ path.join(outDir,"report-data.json"),
+ JSON.stringify(flows,null,2)
+);
+const out = path.join(outDir, "index.html");
+
+console.log("Dashboard created:", out);
+
+return out;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
