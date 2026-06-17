@@ -1,0 +1,19 @@
+Maintenance & Shadowing Activities – Progress Update
+Received knowledge transfer from the Everest team on the test suites maintained across all brands, including suite ownership, execution strategy, and Jenkins auto-scheduled jobs.
+Gained understanding of daily execution processes, regression cycles, and automation maintenance workflows.
+Started analyzing daily Sanity Suite failures and performing root cause analysis (RCA) to identify automation, environment, and application-related issues.
+Initiated investigation and resolution of Regression Suite failures to improve suite stability and execution reliability.
+Raised Pull Requests (PRs) for automation fixes covering both Desktop and Mobile test scenarios.
+Collaborated with the team to understand framework components, execution dependencies, and reporting mechanisms.
+Contributed to improving test suite health by addressing script issues and validating fixes through re-execution.
+Built knowledge of brand-specific automation coverage, execution schedules, and maintenance practices as part of the shadowing program.
+Also team started in reporting application bugs to functional team to raise defects in JIRA
+
+TC Update Regression suite in sprint 26.16 details :
+ 
+Automation scripting was completed in sprint 26.16 for AT and Loft, both Desktop and Mobile Web
+Jenkins job run was triggered and achieved 84-85% Pass rate.
+Report was shared for review to Everest Automation team for Approval on PR #1652
+Failures were observed with Hover functionality in existing and new test steps, which has been investigated for earliest resolution
+Received TC update for Sprint 26.17 post Everest Functional team review and approval.
+We have started analysis on sprint 26.17 TC, to plan automation scripting
