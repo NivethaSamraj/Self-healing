@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<!-- saved from url=(0083)file:///C:/Users/nivetha.samraj/Downloads/AFTA_Playwright/accessibility-report.html -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Accessibility Report — WCAG 2.2 AA</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; color: #1a1a1a; background: #f4f6f9; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 32px 24px 64px; }
+  header { border-bottom: 3px solid #1f3a5f; padding-bottom: 16px; margin-bottom: 24px; }
+  h1 { margin: 0 0 4px; font-size: 26px; color: #1f3a5f; letter-spacing: .3px; }
+  .meta { color: #5a6672; font-size: 13px; }
+  .cards { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; margin: 24px 0 8px; }
+  .card { background: #fff; border: 1px solid #dfe5ec; border-radius: 8px; padding: 14px 8px; text-align: center; }
+  .card-value { font-size: 26px; font-weight: 700; line-height: 1; }
+  .card-label { font-size: 11px; color: #6b7480; margin-top: 6px; text-transform: uppercase; letter-spacing: .4px; }
+  .note { font-size: 12px; color: #6b7480; margin: 10px 0 28px; }
+  section.page { background: #fff; border: 1px solid #dfe5ec; border-radius: 10px; padding: 20px 22px; margin-bottom: 20px; }
+  .page-head { display: flex; align-items: center; justify-content: space-between; }
+  .page-head h2 { margin: 0; font-size: 18px; color: #1f3a5f; }
+  .page-url { color: #7a8592; font-size: 12px; margin: 2px 0 16px; word-break: break-all; }
+  .status { font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 20px; }
+  .status.fail { background: #fdecea; color: #b91c1c; }
+  .status.pass { background: #e7f5ea; color: #1b7a3d; }
+  .empty { color: #1b7a3d; font-size: 14px; padding: 8px 0; }
+  .issue { border: 1px solid #eceff3; border-left: 4px solid #c2410c; border-radius: 6px; padding: 14px 16px; margin-bottom: 14px; background: #fcfcfd; }
+  .issue-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+  .badge { color: #fff; font-size: 11px; font-weight: 700; text-transform: uppercase; padding: 3px 9px; border-radius: 4px; letter-spacing: .3px; }
+  .rule { font-weight: 700; font-size: 15px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .count { margin-left: auto; color: #6b7480; font-size: 12px; }
+  .desc { font-size: 14px; color: #333; margin-bottom: 8px; }
+  .fix { font-size: 13px; color: #294; background: #f0f7f2; border-radius: 5px; padding: 8px 10px; margin-bottom: 8px; color: #1f5130; }
+  .help { font-size: 12px; color: #2e6da4; text-decoration: none; }
+  .help:hover { text-decoration: underline; }
+  .nodes { margin-top: 10px; }
+  .node { margin-bottom: 8px; }
+  pre { background: #1e2430; color: #e6edf3; font-size: 11.5px; padding: 8px 10px; border-radius: 5px; overflow-x: auto; margin: 0; white-space: pre-wrap; word-break: break-all; }
+  .selector { font-family: ui-monospace, monospace; font-size: 11px; color: #7a8592; margin-top: 3px; }
+  .more { font-size: 12px; color: #6b7480; font-style: italic; margin-top: 4px; }
+  footer { text-align: center; color: #97a0ac; font-size: 12px; margin-top: 32px; }
+  @media print { body { background: #fff; } section.page, .card { break-inside: avoid; } }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Accessibility Report</h1>
+      <div class="meta">Standard: WCAG 2.2 AA &nbsp;•&nbsp; Engine: axe-core via Playwright &nbsp;•&nbsp; Generated: Jul 30, 2026, 8:59 PM</div>
+    </header>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-value" style="color:#1f3a5f">3</div>
+        <div class="card-label">Pages scanned</div>
+      </div>
+      <div class="card">
+        <div class="card-value" style="color:#1f3a5f">17</div>
+        <div class="card-label">Rules failed</div>
+      </div>
+      <div class="card">
+        <div class="card-value" style="color:#1f3a5f">195</div>
+        <div class="card-label">Elements affected</div>
+      </div>
+      <div class="card">
+        <div class="card-value" style="color:#b91c1c">8</div>
+        <div class="card-label">Critical</div>
+      </div>
+      <div class="card">
+        <div class="card-value" style="color:#c2410c">184</div>
+        <div class="card-label">Serious</div>
+      </div>
+      <div class="card">
+        <div class="card-value" style="color:#a16207">3</div>
+        <div class="card-label">Moderate</div>
+      </div>
+      <div class="card">
+        <div class="card-value" style="color:#4d7c0f">0</div>
+        <div class="card-label">Minor</div>
+      </div></div>
+    <div class="note">Automated scanning detects roughly 30–40% of WCAG criteria. Pair these results with manual keyboard and screen-reader testing for full WCAG 2.2 AA coverage.</div>
+
+    
+      <section class="page">
+        <div class="page-head">
+          <h2>Category - Dresses</h2>
+          <span class="status fail">6 issues</span>
+        </div>
+        <div class="page-url">https://staging.talbots.com/404</div>
+        
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#b91c1c">critical</span>
+              <span class="rule">aria-allowed-attr</span>
+              <span class="count">4 elements</span>
+            </div>
+            <div class="desc">Ensure an element's role supports its ARIA attributes</div>
+            <div class="fix"><strong>How to fix:</strong> Elements must only use supported ARIA attributes</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/aria-allowed-attr?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;a href="/gift-card/PGIFTCARD.html?dwvar_PGIFTCARD_color=Classic&amp;dwvar_PGIFTCARD_sizeType=MS" data-swatchid="swatch-classic" class="swatch selected" title="Classic" tabindex="0" role="button" aria-checked="true" aria-label="View Color: Classic for Gift Card" aria-disabled="true"&gt;</pre>
+                <div class="selector">#cbcb97ffb4b36ed64d3adafa44 &gt; .product-swatches.ae-exclude &gt; .swatch-list.visible-swatches[aria-label="Gift Card Color Options"] &gt; li[role="presentation"] &gt; .selected[data-swatchid="swatch-classic"][title="Classic"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="/voile-smocked-midi-..." data-swatchid="swatch-ivory_grove_g..." class="swatch selected" title="IVORY/GROVE GREEN" tabindex="0" role="button" aria-checked="true" aria-label="View Color: IVORY/GR..." aria-disabled="true"&gt;</pre>
+                <div class="selector">#dbec95e3e0ce932dc44cd1b500 &gt; .product-swatches.ae-exclude &gt; .swatch-list.visible-swatches[role="radiogroup"] &gt; li[role="presentation"] &gt; .selected[data-swatchid="swatch-ivory_grove_green"][title="IVORY/GROVE GREEN"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="/eyelet-wide-crop-pu..." data-swatchid="swatch-black" class="swatch selected" title="BLACK" tabindex="0" role="button" aria-checked="true" aria-label="View Color: BLACK fo..." aria-disabled="true"&gt;</pre>
+                <div class="selector">#beef084674e9d3736b7551775e &gt; .product-swatches.ae-exclude &gt; .swatch-list.visible-swatches[role="radiogroup"] &gt; li[role="presentation"] &gt; .selected[data-swatchid="swatch-black"][title="BLACK"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="/marina-stripe-jerse..." data-swatchid="swatch-red_pop" class="swatch selected" title="RED POP" tabindex="0" role="button" aria-checked="true" aria-label="View Color: RED POP ..." aria-disabled="true"&gt;</pre>
+                <div class="selector">#\36 bc328a55b5d5b080b8beb02bb &gt; .product-swatches.ae-exclude &gt; .swatch-list.visible-swatches[role="radiogroup"] &gt; li[role="presentation"] &gt; .selected[data-swatchid="swatch-red_pop"][title="RED POP"]</div>
+              </div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">aria-hidden-focus</span>
+              <span class="count">11 elements</span>
+            </div>
+            <div class="desc">Ensure aria-hidden elements are not focusable nor contain focusable elements</div>
+            <div class="fix"><strong>How to fix:</strong> ARIA hidden element must not be focusable or contain focusable elements</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/aria-hidden-focus?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;div class="product-tile  slick-..." algolia-queryid="null" data-itemid="P262041496" data-tealium="{"product_id":["P262..." data-color-object="P262041496" data-slick-index="-4" aria-hidden="true" tabindex="-1" style="width: 237px;"&gt;</pre>
+                <div class="selector">div[data-slick-index="-4"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;div class="product-tile  slick-..." algolia-queryid="null" data-itemid="P262036241" data-tealium="{"product_id":["P262..." data-color-object="P262036241" data-slick-index="-3" aria-hidden="true" tabindex="-1" style="width: 237px;"&gt;</pre>
+                <div class="selector">div[data-slick-index="-3"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;div class="product-tile  slick-..." algolia-queryid="null" data-itemid="P261033905" data-tealium="{"product_id":["P261..." data-color-object="P261033905" data-slick-index="-2" aria-hidden="true" tabindex="-1" style="width: 237px;"&gt;</pre>
+                <div class="selector">div[data-slick-index="-2"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;div class="product-tile  slick-..." algolia-queryid="null" data-itemid="P261013181" data-tealium="{"product_id":["P261..." data-color-object="P261013181" data-slick-index="-1" aria-hidden="true" tabindex="-1" style="width: 237px;"&gt;</pre>
+                <div class="selector">div[data-slick-index="-1"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;div class="product-tile  slick-..." id="d3ed809fefd7b8b8c461..." algolia-queryid="null" data-itemid="P263161423" data-tealium="{"product_id":["P263..." data-color-object="P263161423" data-slick-index="4" aria-hidden="true" tabindex="-1" style="width: 237px;"&gt;</pre>
+                <div class="selector">#d3ed809fefd7b8b8c4618bf51f</div>
+              </div><div class="more">…and 6 more element(s)</div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">link-name</span>
+              <span class="count">52 elements</span>
+            </div>
+            <div class="desc">Ensure links have discernible text</div>
+            <div class="fix"><strong>How to fix:</strong> Give each link discernible text — visible text inside the link, or a descriptive aria-label (e.g. aria-label="Shop new arrivals"). Empty overlay links that cover an image are the usual cause.</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/link-name?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen75"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen123"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen165"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen207"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen249"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div><div class="more">…and 47 more element(s)</div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">list</span>
+              <span class="count">1 element</span>
+            </div>
+            <div class="desc">Ensure that lists are structured correctly</div>
+            <div class="fix"><strong>How to fix:</strong> &lt;ul&gt; and &lt;ol&gt; must only directly contain &lt;li&gt;, &lt;script&gt; or &lt;template&gt; elements</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/list?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;ul class="menu-category level-1 menu-category-tals" data-a11y-menu-attached="true"&gt;</pre>
+                <div class="selector">.menu-category</div>
+              </div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">nested-interactive</span>
+              <span class="count">1 element</span>
+            </div>
+            <div class="desc">Ensure interactive controls are not nested as they are not always announced by screen readers or can cause focus problems for assistive technologies</div>
+            <div class="fix"><strong>How to fix:</strong> Interactive controls must not be nested</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/nested-interactive?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;div class="tcc-cta-include header-only" aria-expanded="false" role="button" tabindex="0"&gt;</pre>
+                <div class="selector">.header-only.tcc-cta-include[role="button"]</div>
+              </div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#a16207">moderate</span>
+              <span class="rule">meta-viewport</span>
+              <span class="count">1 element</span>
+            </div>
+            <div class="desc">Ensure &lt;meta name="viewport"&gt; does not disable text scaling and zooming</div>
+            <div class="fix"><strong>How to fix:</strong> Remove user-scalable=no and maximum-scale=1 from the viewport meta tag so low-vision users can pinch-to-zoom. Use content="width=device-width, initial-scale=1".</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/meta-viewport?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;meta name="viewport" content="width=device-width,height=device-height, initial-scale=1, maximum-scale=1"&gt;</pre>
+                <div class="selector">meta[name="viewport"]</div>
+              </div></div>
+          </div>
+      </section>
+      <section class="page">
+        <div class="page-head">
+          <h2>Homepage</h2>
+          <span class="status fail">5 issues</span>
+        </div>
+        <div class="page-url">https://staging.talbots.com/</div>
+        
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">color-contrast</span>
+              <span class="count">1 element</span>
+            </div>
+            <div class="desc">Ensure the contrast between foreground and background colors meets WCAG 2 AA minimum contrast ratio thresholds</div>
+            <div class="fix"><strong>How to fix:</strong> Increase the contrast ratio between text and background to at least 4.5:1 (3:1 for large text).</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/color-contrast?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;a href="https://staging.talbots.com/sale?intcmp=20260727_homepage_promo_link_sale_bf_04" class="shop-now-atag tbttn tbttn-lrg btn font-weight-bold text-uppercase text-center d-block w-100 text-nowrap rounded-0" style="pointer-events: auto"&gt;
+        SHOP SALE ON SALE
+      &lt;/a&gt;</pre>
+                <div class="selector">.shop-now-atag</div>
+              </div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">link-name</span>
+              <span class="count">46 elements</span>
+            </div>
+            <div class="desc">Ensure links have discernible text</div>
+            <div class="fix"><strong>How to fix:</strong> Give each link discernible text — visible text inside the link, or a descriptive aria-label (e.g. aria-label="Shop new arrivals"). Empty overlay links that cover an image are the usual cause.</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/link-name?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen75"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen123"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen165"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen207"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen249"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div><div class="more">…and 41 more element(s)</div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">list</span>
+              <span class="count">1 element</span>
+            </div>
+            <div class="desc">Ensure that lists are structured correctly</div>
+            <div class="fix"><strong>How to fix:</strong> &lt;ul&gt; and &lt;ol&gt; must only directly contain &lt;li&gt;, &lt;script&gt; or &lt;template&gt; elements</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/list?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;ul class="menu-category level-1 menu-category-tals" data-a11y-menu-attached="true"&gt;</pre>
+                <div class="selector">.menu-category</div>
+              </div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">nested-interactive</span>
+              <span class="count">1 element</span>
+            </div>
+            <div class="desc">Ensure interactive controls are not nested as they are not always announced by screen readers or can cause focus problems for assistive technologies</div>
+            <div class="fix"><strong>How to fix:</strong> Interactive controls must not be nested</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/nested-interactive?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;div class="tcc-cta-include header-only" aria-expanded="false" role="button" tabindex="0"&gt;</pre>
+                <div class="selector">.header-only.tcc-cta-include[role="button"]</div>
+              </div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#a16207">moderate</span>
+              <span class="rule">meta-viewport</span>
+              <span class="count">1 element</span>
+            </div>
+            <div class="desc">Ensure &lt;meta name="viewport"&gt; does not disable text scaling and zooming</div>
+            <div class="fix"><strong>How to fix:</strong> Remove user-scalable=no and maximum-scale=1 from the viewport meta tag so low-vision users can pinch-to-zoom. Use content="width=device-width, initial-scale=1".</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/meta-viewport?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;meta name="viewport" content="width=device-width,height=device-height, initial-scale=1, maximum-scale=1"&gt;</pre>
+                <div class="selector">meta[name="viewport"]</div>
+              </div></div>
+          </div>
+      </section>
+      <section class="page">
+        <div class="page-head">
+          <h2>Product Detail</h2>
+          <span class="status fail">6 issues</span>
+        </div>
+        <div class="page-url">https://staging.talbots.com/404</div>
+        
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#b91c1c">critical</span>
+              <span class="rule">aria-allowed-attr</span>
+              <span class="count">4 elements</span>
+            </div>
+            <div class="desc">Ensure an element's role supports its ARIA attributes</div>
+            <div class="fix"><strong>How to fix:</strong> Elements must only use supported ARIA attributes</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/aria-allowed-attr?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;a href="/gift-card/PGIFTCARD.html?dwvar_PGIFTCARD_color=Classic&amp;dwvar_PGIFTCARD_sizeType=MS" data-swatchid="swatch-classic" class="swatch selected" title="Classic" tabindex="0" role="button" aria-checked="true" aria-label="View Color: Classic for Gift Card" aria-disabled="true"&gt;</pre>
+                <div class="selector">#cbcb97ffb4b36ed64d3adafa44 &gt; .product-swatches.ae-exclude &gt; .swatch-list.visible-swatches[aria-label="Gift Card Color Options"] &gt; li[role="presentation"] &gt; .selected[data-swatchid="swatch-classic"][title="Classic"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="/voile-smocked-midi-..." data-swatchid="swatch-ivory_grove_g..." class="swatch selected" title="IVORY/GROVE GREEN" tabindex="0" role="button" aria-checked="true" aria-label="View Color: IVORY/GR..." aria-disabled="true"&gt;</pre>
+                <div class="selector">#dbec95e3e0ce932dc44cd1b500 &gt; .product-swatches.ae-exclude &gt; .swatch-list.visible-swatches[role="radiogroup"] &gt; li[role="presentation"] &gt; .selected[data-swatchid="swatch-ivory_grove_green"][title="IVORY/GROVE GREEN"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="/eyelet-wide-crop-pu..." data-swatchid="swatch-black" class="swatch selected" title="BLACK" tabindex="0" role="button" aria-checked="true" aria-label="View Color: BLACK fo..." aria-disabled="true"&gt;</pre>
+                <div class="selector">#beef084674e9d3736b7551775e &gt; .product-swatches.ae-exclude &gt; .swatch-list.visible-swatches[role="radiogroup"] &gt; li[role="presentation"] &gt; .selected[data-swatchid="swatch-black"][title="BLACK"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="/marina-stripe-jerse..." data-swatchid="swatch-red_pop" class="swatch selected" title="RED POP" tabindex="0" role="button" aria-checked="true" aria-label="View Color: RED POP ..." aria-disabled="true"&gt;</pre>
+                <div class="selector">#\36 bc328a55b5d5b080b8beb02bb &gt; .product-swatches.ae-exclude &gt; .swatch-list.visible-swatches[role="radiogroup"] &gt; li[role="presentation"] &gt; .selected[data-swatchid="swatch-red_pop"][title="RED POP"]</div>
+              </div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">aria-hidden-focus</span>
+              <span class="count">16 elements</span>
+            </div>
+            <div class="desc">Ensure aria-hidden elements are not focusable nor contain focusable elements</div>
+            <div class="fix"><strong>How to fix:</strong> ARIA hidden element must not be focusable or contain focusable elements</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/aria-hidden-focus?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;div class="product-tile  slick-..." algolia-queryid="null" data-itemid="P262041496" data-tealium="{"product_id":["P262..." data-color-object="P262041496" data-slick-index="-4" aria-hidden="true" tabindex="-1" style="width: 237px;"&gt;</pre>
+                <div class="selector">div[data-slick-index="-4"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;div class="product-tile  slick-..." algolia-queryid="null" data-itemid="P262036241" data-tealium="{"product_id":["P262..." data-color-object="P262036241" data-slick-index="-3" aria-hidden="true" tabindex="-1" style="width: 237px;"&gt;</pre>
+                <div class="selector">div[data-slick-index="-3"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;div class="product-tile  slick-..." algolia-queryid="null" data-itemid="P261033905" data-tealium="{"product_id":["P261..." data-color-object="P261033905" data-slick-index="-2" aria-hidden="true" tabindex="-1" style="width: 237px;"&gt;</pre>
+                <div class="selector">div[data-slick-index="-2"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;div class="product-tile  slick-..." algolia-queryid="null" data-itemid="P261013181" data-tealium="{"product_id":["P261..." data-color-object="P261013181" data-slick-index="-1" aria-hidden="true" tabindex="-1" style="width: 237px;"&gt;</pre>
+                <div class="selector">div[data-slick-index="-1"]</div>
+              </div>
+              <div class="node">
+                <pre>&lt;div class="product-tile  slick-..." id="d3ed809fefd7b8b8c461..." algolia-queryid="null" data-itemid="P263161423" data-tealium="{"product_id":["P263..." data-color-object="P263161423" data-slick-index="4" aria-hidden="true" tabindex="-1" style="width: 237px;"&gt;</pre>
+                <div class="selector">#d3ed809fefd7b8b8c4618bf51f</div>
+              </div><div class="more">…and 11 more element(s)</div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">link-name</span>
+              <span class="count">52 elements</span>
+            </div>
+            <div class="desc">Ensure links have discernible text</div>
+            <div class="fix"><strong>How to fix:</strong> Give each link discernible text — visible text inside the link, or a descriptive aria-label (e.g. aria-label="Shop new arrivals"). Empty overlay links that cover an image are the usual cause.</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/link-name?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen75"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen123"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen165"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen207"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div>
+              <div class="node">
+                <pre>&lt;a href="#" class="x-grid3-focus" tabindex="-1" id="ext-gen249"&gt;&lt;/a&gt;</pre>
+                <div class="selector">#DW-SFToolkit</div>
+              </div><div class="more">…and 47 more element(s)</div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">list</span>
+              <span class="count">1 element</span>
+            </div>
+            <div class="desc">Ensure that lists are structured correctly</div>
+            <div class="fix"><strong>How to fix:</strong> &lt;ul&gt; and &lt;ol&gt; must only directly contain &lt;li&gt;, &lt;script&gt; or &lt;template&gt; elements</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/list?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;ul class="menu-category level-1 menu-category-tals" data-a11y-menu-attached="true"&gt;</pre>
+                <div class="selector">.menu-category</div>
+              </div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#c2410c">serious</span>
+              <span class="rule">nested-interactive</span>
+              <span class="count">1 element</span>
+            </div>
+            <div class="desc">Ensure interactive controls are not nested as they are not always announced by screen readers or can cause focus problems for assistive technologies</div>
+            <div class="fix"><strong>How to fix:</strong> Interactive controls must not be nested</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/nested-interactive?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;div class="tcc-cta-include header-only" aria-expanded="false" role="button" tabindex="0"&gt;</pre>
+                <div class="selector">.header-only.tcc-cta-include[role="button"]</div>
+              </div></div>
+          </div>
+          <div class="issue">
+            <div class="issue-head">
+              <span class="badge" style="background:#a16207">moderate</span>
+              <span class="rule">meta-viewport</span>
+              <span class="count">1 element</span>
+            </div>
+            <div class="desc">Ensure &lt;meta name="viewport"&gt; does not disable text scaling and zooming</div>
+            <div class="fix"><strong>How to fix:</strong> Remove user-scalable=no and maximum-scale=1 from the viewport meta tag so low-vision users can pinch-to-zoom. Use content="width=device-width, initial-scale=1".</div>
+            <a class="help" href="https://dequeuniversity.com/rules/axe/4.12/meta-viewport?application=playwright" target="_blank" rel="noopener">Deque reference →</a>
+            <div class="nodes">
+              <div class="node">
+                <pre>&lt;meta name="viewport" content="width=device-width,height=device-height, initial-scale=1, maximum-scale=1"&gt;</pre>
+                <div class="selector">meta[name="viewport"]</div>
+              </div></div>
+          </div>
+      </section>
+
+    <footer>Generated by axe-core + Playwright · internal QA accessibility harness</footer>
+  </div>
+
+</body></html>
